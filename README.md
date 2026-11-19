@@ -66,7 +66,7 @@ Control Agent (/opt/control-agent/agent.js, systemd, runs as `root`)
 Prerequisites: Apache2, PHP 8.x (`php-sqlite3` / `pdo_sqlite`), Node.js 20+, SQLite3, Certbot (`python3-certbot-apache`).
 
 ```bash
-git clone <your-repo-url> dietpi-panel
+git clone https://github.com/ffrcababan/dietpi-panel.git dietpi-panel
 cd dietpi-panel
 sudo ./install.sh
 ```

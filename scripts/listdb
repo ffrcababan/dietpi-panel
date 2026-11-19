@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# listdb
+# Scans /srv/db/*/data.sqlite and outputs a JSON array of {name, sizeBytes, modified, domain, hasSite}.
+
+if [[ -f /etc/control-agent/config.env ]]; then
+    # shellcheck disable=SC1091
+    source /etc/control-agent/config.env
+fi
+
+BASE_DOMAIN="${BASE_DOMAIN:-localhost}"
+
+shopt -s nullglob
+db_files=(/srv/db/*/data.sqlite)
+shopt -u nullglob
+
+printf '['
+first=1
+for db_file in "${db_files[@]}"; do
+    dir_path="${db_file%/data.sqlite}"
+    name="${dir_path##*/}"
+
+    if [[ "$name" == "_panel" || "$name" == "backups" ]]; then
+        continue
+    fi
+    if [[ ! "$name" =~ ^[a-z0-9-]{1,32}$ ]]; then
+        continue
+    fi
+
+    size_bytes="$(stat -c '%s' "$db_file")"
+    mtime_epoch="$(stat -c '%Y' "$db_file")"
+    modified="$(date -u -d "@${mtime_epoch}" '+%Y-%m-%dT%H:%M:%SZ')"
+
+    domain="${name}.${BASE_DOMAIN}"
+    site_type="none"
+    vhost_file="/etc/apache2/sites-available/${name}.conf"
+    if [[ -f "$vhost_file" ]]; then
+        existing_domain="$(awk 'tolower($1)=="servername" {print $2; exit}' "$vhost_file" || true)"
+        if [[ -n "$existing_domain" ]]; then
+            domain="$existing_domain"
+        fi
+        parsed_type="$(sed -n 's/^# dietpi-panel:type=\([a-z0-9-]*\)$/\1/p' "$vhost_file" | head -n1 || true)"
+        if [[ -n "$parsed_type" ]]; then
+            site_type="$parsed_type"
+        else
+            site_type="custom"
+        fi
+    fi
+
+    if [[ $first -eq 0 ]]; then
+        printf ','
+    fi
+    first=0
+
+    printf '{"name":"%s","sizeBytes":%s,"modified":"%s","domain":"%s","siteType":"%s"}' \
+        "$name" "$size_bytes" "$modified" "$domain" "$site_type"
+done
+printf ']\n'

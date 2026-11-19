@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mksite <name> <type> [domain] [port]
+# Creates an Apache vhost from /etc/skel/vhost-<type>.conf, docroot /var/www/<name>,
+# symlinks /var/www/_shared/db.php, enables site, and reloads Apache.
+
+if [[ -f /etc/control-agent/config.env ]]; then
+    # shellcheck disable=SC1091
+    source /etc/control-agent/config.env
+fi
+
+NAME="${1:-}"
+TYPE="${2:-}"
+CUSTOM_DOMAIN="${3:-}"
+REQUESTED_PORT="${4:-}"
+
+if [[ ! "$NAME" =~ ^[a-z0-9-]{1,32}$ ]]; then
+    echo "Invalid site name: must match ^[a-z0-9-]{1,32}$" >&2
+    exit 1
+fi
+
+case "$NAME" in
+    panel|dietpi-panel|backups|www|localhost|default|shared)
+        echo "Reserved name cannot be used for a site: $NAME" >&2
+        exit 1
+        ;;
+esac
+
+if [[ ! "$TYPE" =~ ^(static|php|nextjs)$ ]]; then
+    echo "Invalid site type: must be static, php, or nextjs" >&2
+    exit 1
+fi
+
+BASE_DOMAIN="${BASE_DOMAIN:-localhost}"
+if [[ -n "$CUSTOM_DOMAIN" ]]; then
+    if [[ ${#CUSTOM_DOMAIN} -gt 253 || ! "$CUSTOM_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+        echo "Invalid custom domain: $CUSTOM_DOMAIN" >&2
+        exit 1
+    fi
+    DOMAIN="$CUSTOM_DOMAIN"
+else
+    DOMAIN="${NAME}.${BASE_DOMAIN}"
+fi
+
+if [[ "$DOMAIN" == "panel.${BASE_DOMAIN}" ]]; then
+    echo "Cannot overwrite the panel domain: $DOMAIN" >&2
+    exit 1
+fi
+
+SKEL_VHOST="/etc/skel/vhost-${TYPE}.conf"
+SKEL_SYSTEMD="/etc/skel/app-nextjs.service.tmpl"
+VHOST_FILE="/etc/apache2/sites-available/${NAME}.conf"
+DOCROOT="/var/www/${NAME}"
+SHARED_DB_PHP="/var/www/_shared/db.php"
+
+if [[ ! -f "$SKEL_VHOST" ]]; then
+    echo "Template missing: $SKEL_VHOST" >&2
+    exit 1
+fi
+
+if [[ ! -f "$SHARED_DB_PHP" ]]; then
+    echo "Shared endpoint missing: $SHARED_DB_PHP" >&2
+    exit 1
+fi
+
+if [[ -f "$VHOST_FILE" ]]; then
+    if ! grep -q '^# dietpi-panel:type=dbonly$' "$VHOST_FILE"; then
+        echo "Site already exists: $NAME" >&2
+        exit 1
+    fi
+fi
+
+# Check no other vhost already claims this ServerName
+shopt -s nullglob
+for existing_conf in /etc/apache2/sites-available/*.conf; do
+    if [[ "$existing_conf" == "$VHOST_FILE" ]]; then
+        continue
+    fi
+    existing_sn="$(awk 'tolower($1)=="servername" {print tolower($2); exit}' "$existing_conf" || true)"
+    if [[ "$existing_sn" == "$DOMAIN" ]]; then
+        echo "Domain already configured in another virtual host: $DOMAIN" >&2
+        exit 1
+    fi
+done
+shopt -u nullglob
+
+PORT="0"
+if [[ "$TYPE" == "nextjs" ]]; then
+    if [[ -n "$REQUESTED_PORT" ]]; then
+        if [[ ! "$REQUESTED_PORT" =~ ^[0-9]+$ ]] || (( REQUESTED_PORT < 3001 || REQUESTED_PORT > 39999 )); then
+            echo "Invalid port for nextjs site: must be integer 3001..39999" >&2
+            exit 1
+        fi
+        PORT="$REQUESTED_PORT"
+    else
+        used_ports=" $( (grep -RhoE '127\.0\.0\.1:[0-9]+' /etc/apache2/sites-available/*.conf 2>/dev/null || true) | awk -F: '{print $2}' | tr '\n' ' ') "
+        candidate=3100
+        while (( candidate <= 39999 )); do
+            if [[ "$used_ports" != *" ${candidate} "* ]]; then
+                if ! command -v ss >/dev/null 2>&1 || ! ss -H -tln 2>/dev/null | awk -v p=":${candidate}$" '$4 ~ p {found=1} END {exit !found}'; then
+                    PORT="$candidate"
+                    break
+                fi
+            fi
+            candidate=$((candidate + 1))
+        done
+        if (( PORT == 0 )); then
+            echo "No free local port found in range 3100..39999" >&2
+            exit 1
+        fi
+    fi
+fi
+
+mkdir -p "$DOCROOT"
+chown www-data:www-data "$DOCROOT"
+chmod 0755 "$DOCROOT"
+ln -sfn "$SHARED_DB_PHP" "${DOCROOT}/db.php"
+
+if [[ "$TYPE" == "static" && ! -f "${DOCROOT}/index.html" ]]; then
+    cat > "${DOCROOT}/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>${DOMAIN}</title></head>
+<body style="font-family:system-ui,sans-serif;background:#0b0e14;color:#e2e8f0;padding:3rem">
+<h1>${DOMAIN}</h1>
+<p>Static site <code>${NAME}</code> is live on DietPi Panel.</p>
+</body>
+</html>
+EOF
+    chown www-data:www-data "${DOCROOT}/index.html"
+elif [[ "$TYPE" == "php" && ! -f "${DOCROOT}/index.php" && ! -f "${DOCROOT}/index.html" ]]; then
+    cat > "${DOCROOT}/index.php" <<EOF
+<?php
+header('Content-Type: text/html; charset=utf-8');
+?>
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title><?= htmlspecialchars('${DOMAIN}') ?></title></head>
+<body style="font-family:system-ui,sans-serif;background:#0b0e14;color:#e2e8f0;padding:3rem">
+<h1><?= htmlspecialchars('${DOMAIN}') ?></h1>
+<p>PHP site <code><?= htmlspecialchars('${NAME}') ?></code> is live (PHP <?= PHP_VERSION ?>).</p>
+</body>
+</html>
+EOF
+    chown www-data:www-data "${DOCROOT}/index.php"
+elif [[ "$TYPE" == "nextjs" ]]; then
+    if [[ ! -f "${DOCROOT}/README-NEXTJS.txt" ]]; then
+        cat > "${DOCROOT}/README-NEXTJS.txt" <<EOF
+Next.js site "${NAME}" (${DOMAIN})
+Assigned internal port: ${PORT}
+Systemd unit: /etc/systemd/system/app-${NAME}.service
+
+Deploy your built Next.js app into ${DOCROOT}, run npm install && npm run build,
+then start the service:
+  systemctl enable --now app-${NAME}.service
+
+Note: /db.php is excluded from ProxyPass and handled directly by Apache + PHP.
+EOF
+        chown www-data:www-data "${DOCROOT}/README-NEXTJS.txt"
+    fi
+    SYSTEMD_UNIT="/etc/systemd/system/app-${NAME}.service"
+    if [[ ! -f "$SYSTEMD_UNIT" && -f "$SKEL_SYSTEMD" ]]; then
+        sed -e "s|__NAME__|${NAME}|g" -e "s|__PORT__|${PORT}|g" "$SKEL_SYSTEMD" > "$SYSTEMD_UNIT"
+        chmod 0644 "$SYSTEMD_UNIT"
+        systemctl daemon-reload
+    fi
+fi
+
+BACKUP_OLD_VHOST=""
+if [[ -f "$VHOST_FILE" ]]; then
+    BACKUP_OLD_VHOST="${VHOST_FILE}.bak"
+    cp -a "$VHOST_FILE" "$BACKUP_OLD_VHOST"
+fi
+
+sed -e "s|__NAME__|${NAME}|g" \
+    -e "s|__DOMAIN__|${DOMAIN}|g" \
+    -e "s|__PORT__|${PORT}|g" \
+    "$SKEL_VHOST" > "$VHOST_FILE"
+chmod 0644 "$VHOST_FILE"
+
+a2ensite "${NAME}.conf" >/dev/null
+if ! apache2ctl configtest >/dev/null 2>&1; then
+    if [[ -n "$BACKUP_OLD_VHOST" && -f "$BACKUP_OLD_VHOST" ]]; then
+        mv -f "$BACKUP_OLD_VHOST" "$VHOST_FILE"
+    else
+        a2dissite "${NAME}.conf" >/dev/null 2>&1 || true
+        rm -f "$VHOST_FILE"
+    fi
+    echo "Apache configtest failed for ${NAME}.conf; rolled back" >&2
+    exit 1
+fi
+rm -f "$BACKUP_OLD_VHOST"
+systemctl reload apache2
+
+if [[ "$TYPE" == "nextjs" ]]; then
+    printf '{"name":"%s","type":"%s","domain":"%s","docroot":"%s","port":%s}\n' \
+        "$NAME" "$TYPE" "$DOMAIN" "$DOCROOT" "$PORT"
+else
+    printf '{"name":"%s","type":"%s","domain":"%s","docroot":"%s","port":null}\n' \
+        "$NAME" "$TYPE" "$DOMAIN" "$DOCROOT"
+fi

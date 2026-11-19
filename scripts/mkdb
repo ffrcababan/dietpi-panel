@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mkdb <name>
+# Creates /srv/db/<name>/data.sqlite in WAL mode, sets up Apache SetEnv + /db.php,
+# creates a minimal db-only vhost if no site exists yet, and prints the API key once.
+
+if [[ -f /etc/control-agent/config.env ]]; then
+    # shellcheck disable=SC1091
+    source /etc/control-agent/config.env
+fi
+
+NAME="${1:-}"
+if [[ ! "$NAME" =~ ^[a-z0-9-]{1,32}$ ]]; then
+    echo "Invalid database name: must match ^[a-z0-9-]{1,32}$" >&2
+    exit 1
+fi
+
+case "$NAME" in
+    panel|dietpi-panel|backups|www|localhost|default|shared)
+        echo "Reserved name cannot be used for a database: $NAME" >&2
+        exit 1
+        ;;
+esac
+
+BASE_DOMAIN="${BASE_DOMAIN:-localhost}"
+DB_DIR="/srv/db/${NAME}"
+DB_PATH="${DB_DIR}/data.sqlite"
+DOCROOT="/var/www/${NAME}"
+SHARED_DB_PHP="/var/www/_shared/db.php"
+CONF_DB_DIR="/etc/apache2/conf-app-db"
+CONF_DB_FILE="${CONF_DB_DIR}/${NAME}.conf"
+VHOST_FILE="/etc/apache2/sites-available/${NAME}.conf"
+SKEL_DBONLY="/etc/skel/vhost-dbonly.conf"
+
+if [[ -e "$DB_PATH" ]]; then
+    echo "Database already exists: $DB_PATH" >&2
+    exit 1
+fi
+
+if [[ ! -f "$SHARED_DB_PHP" ]]; then
+    echo "Shared endpoint missing: $SHARED_DB_PHP" >&2
+    exit 1
+fi
+
+mkdir -p "$DB_DIR" "$DOCROOT" "$CONF_DB_DIR"
+
+sqlite3 "$DB_PATH" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA user_version=0;" >/dev/null
+chown -R www-data:www-data "$DB_DIR"
+chmod 0750 "$DB_DIR"
+chmod 0640 "$DB_PATH"
+
+API_KEY="$(openssl rand -hex 32)"
+
+umask 0177
+cat > "$CONF_DB_FILE" <<EOF
+SetEnv APP_DB_PATH "${DB_PATH}"
+SetEnv APP_API_KEY "${API_KEY}"
+EOF
+umask 0022
+chown root:root "$CONF_DB_FILE"
+chmod 0600 "$CONF_DB_FILE"
+
+chown www-data:www-data "$DOCROOT"
+chmod 0755 "$DOCROOT"
+ln -sfn "$SHARED_DB_PHP" "${DOCROOT}/db.php"
+
+DOMAIN="${NAME}.${BASE_DOMAIN}"
+if [[ -f "$VHOST_FILE" ]]; then
+    EXISTING_DOMAIN="$(awk 'tolower($1)=="servername" {print $2; exit}' "$VHOST_FILE" || true)"
+    if [[ -n "$EXISTING_DOMAIN" ]]; then
+        DOMAIN="$EXISTING_DOMAIN"
+    fi
+else
+    if [[ ! -f "$SKEL_DBONLY" ]]; then
+        echo "Template missing: $SKEL_DBONLY" >&2
+        exit 1
+    fi
+    sed -e "s|__NAME__|${NAME}|g" -e "s|__DOMAIN__|${DOMAIN}|g" "$SKEL_DBONLY" > "$VHOST_FILE"
+    chmod 0644 "$VHOST_FILE"
+fi
+
+a2ensite "${NAME}.conf" >/dev/null
+if ! apache2ctl configtest >/dev/null 2>&1; then
+    echo "Apache configtest failed after configuring ${NAME}.conf" >&2
+    exit 1
+fi
+systemctl reload apache2
+
+printf '{"name":"%s","domain":"%s","dbPath":"%s","apiKey":"%s","vhost":"%s"}\n' \
+    "$NAME" "$DOMAIN" "$DB_PATH" "$API_KEY" "$VHOST_FILE"

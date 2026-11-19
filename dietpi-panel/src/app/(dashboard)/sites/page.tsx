@@ -1,0 +1,537 @@
+'use client';
+
+import React, { useState } from 'react';
+import useSWR from 'swr';
+import { IconLock, IconPlus, IconTrash } from '@/components/Icons';
+import { Modal } from '@/components/Modal';
+import { usePanel } from '@/components/PanelContext';
+import { StatusBadge } from '@/components/StatusBadge';
+import { apiFetcher, apiMutate } from '@/lib/client-api';
+import { DOMAIN_RE, NAME_RE, RESERVED_NAMES, type SiteType } from '@/lib/validation';
+import type { SiteRecord } from '@/app/api/sites/route';
+
+export default function SitesPage() {
+  const { me } = usePanel();
+  const { data, error, mutate } = useSWR<{ sites: SiteRecord[] }>(
+    '/api/sites',
+    apiFetcher,
+    { refreshInterval: 5000 }
+  );
+
+  const [createOpen, setCreateOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [siteType, setSiteType] = useState<SiteType>('static');
+  const [customDomain, setCustomDomain] = useState('');
+  const [customPort, setCustomPort] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  const [certOpen, setCertOpen] = useState(false);
+  const [certDomain, setCertDomain] = useState('');
+  const [certDryRun, setCertDryRun] = useState(false);
+  const [certRunning, setCertRunning] = useState(false);
+  const [certResult, setCertResult] = useState<{
+    ok: boolean;
+    stdout: string;
+    stderr: string;
+  } | null>(null);
+
+  const [deleteTarget, setDeleteTarget] = useState<SiteRecord | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  const sites = data?.sites ?? [];
+  const baseDomain = me?.baseDomain || 'mydomain.com';
+
+  const nameError = (() => {
+    if (!name) return null;
+    if (!NAME_RE.test(name)) return 'Use 1-32 lowercase letters, digits, or hyphens.';
+    if (RESERVED_NAMES.has(name)) return `"${name}" is a reserved name.`;
+    return null;
+  })();
+
+  const domainError = (() => {
+    const trimmed = customDomain.trim().toLowerCase();
+    if (!trimmed) return null;
+    if (!DOMAIN_RE.test(trimmed)) return 'Enter a valid domain (e.g. app.example.com).';
+    return null;
+  })();
+
+  const isFormValid =
+    name.length > 0 &&
+    NAME_RE.test(name) &&
+    !RESERVED_NAMES.has(name) &&
+    !domainError;
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!me?.csrfToken || !isFormValid) return;
+
+    setCreating(true);
+    setCreateError(null);
+    try {
+      await apiMutate('/api/sites', 'POST', me.csrfToken, {
+        name,
+        type: siteType,
+        domain: customDomain.trim() || undefined,
+        port:
+          siteType === 'nextjs' && customPort.trim()
+            ? Number.parseInt(customPort.trim(), 10)
+            : undefined,
+      });
+      setCreateOpen(false);
+      setName('');
+      setCustomDomain('');
+      setCustomPort('');
+      await mutate();
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : 'Failed to create site');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!me?.csrfToken || !deleteTarget) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await apiMutate(
+        `/api/sites/${encodeURIComponent(deleteTarget.name)}`,
+        'DELETE',
+        me.csrfToken
+      );
+      setDeleteTarget(null);
+      await mutate();
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : 'Failed to archive site');
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const openCertModal = (domain = '') => {
+    setCertDomain(domain);
+    setCertDryRun(false);
+    setCertResult(null);
+    setCertOpen(true);
+  };
+
+  const handleCertSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!me?.csrfToken || !certDomain.trim()) return;
+
+    setCertRunning(true);
+    setCertResult(null);
+    try {
+      const res = await fetch('/api/cert', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-panel-csrf': me.csrfToken,
+        },
+        body: JSON.stringify({
+          domain: certDomain.trim().toLowerCase(),
+          dryRun: certDryRun,
+        }),
+      });
+      const json = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        stdout?: string;
+        stderr?: string;
+        error?: string;
+      };
+      setCertResult({
+        ok: res.ok && Boolean(json.ok),
+        stdout: json.stdout || '',
+        stderr: json.stderr || json.error || '',
+      });
+      if (res.ok && json.ok && !certDryRun) {
+        await mutate();
+      }
+    } catch (err) {
+      setCertResult({
+        ok: false,
+        stdout: '',
+        stderr: err instanceof Error ? err.message : 'Failed to run certbot',
+      });
+    } finally {
+      setCertRunning(false);
+    }
+  };
+
+  const typeTone = (t: string): 'blue' | 'amber' | 'green' | 'slate' => {
+    if (t === 'nextjs') return 'blue';
+    if (t === 'php') return 'amber';
+    if (t === 'static') return 'green';
+    return 'slate';
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-100">
+            Sites &amp; Virtual Hosts
+          </h1>
+          <p className="mt-1 text-sm text-slate-400">
+            Apache virtual hosts for static, PHP, Next.js apps, and TLS certificates.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => openCertModal(sites.find((s) => !s.ssl)?.serverName || '')}
+            className="inline-flex items-center gap-2 rounded-lg border border-borderline bg-surface px-3.5 py-2 text-sm font-medium text-slate-200 hover:border-slate-500 transition"
+          >
+            <IconLock className="w-4 h-4 text-emerald-400" />
+            <span>Issue TLS Cert</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setName('');
+              setSiteType('static');
+              setCustomDomain('');
+              setCustomPort('');
+              setCreateError(null);
+              setCreateOpen(true);
+            }}
+            className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-accent-hover transition"
+          >
+            <IconPlus className="w-4 h-4" />
+            <span>Create Site</span>
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          {error.message}
+        </div>
+      )}
+
+      <div className="rounded-xl border border-borderline bg-surface overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="border-b border-borderline bg-canvas/50 text-xs uppercase text-slate-400">
+              <tr>
+                <th className="px-5 py-3 font-medium">Domain</th>
+                <th className="px-5 py-3 font-medium">Type</th>
+                <th className="px-5 py-3 font-medium">TLS / SSL</th>
+                <th className="px-5 py-3 font-medium">Target / Docroot</th>
+                <th className="px-5 py-3 font-medium">Status</th>
+                <th className="px-5 py-3 font-medium text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-borderline">
+              {sites.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="px-5 py-10 text-center text-sm text-slate-500">
+                    No enabled sites found.
+                  </td>
+                </tr>
+              ) : (
+                sites.map((site) => (
+                  <tr key={`${site.name}-${site.serverName}`} className="hover:bg-elevated/40">
+                    <td className="px-5 py-3.5">
+                      <a
+                        href={`${site.ssl ? 'https' : 'http'}://${site.serverName}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-mono text-sm font-medium text-slate-100 hover:text-accent transition"
+                      >
+                        {site.serverName}
+                      </a>
+                      <div className="mt-0.5 flex items-center gap-2 text-[11px] text-slate-500">
+                        <span>{site.name}</span>
+                        {site.hasDb && (
+                          <span className="text-sky-400">• SQLite /db.php</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-5 py-3.5">
+                      <StatusBadge
+                        tone={typeTone(site.type)}
+                        label={site.type === 'dbonly' ? 'db-only' : site.type}
+                      />
+                    </td>
+                    <td className="px-5 py-3.5">
+                      {site.ssl ? (
+                        <StatusBadge tone="green" label="TLS Active" dot />
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => openCertModal(site.serverName)}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-300 hover:bg-amber-500/20 transition"
+                        >
+                          <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                          <span>HTTP Only · Get Cert</span>
+                        </button>
+                      )}
+                    </td>
+                    <td className="px-5 py-3.5 font-mono text-xs text-slate-400">
+                      <div>{site.docroot}</div>
+                      {site.port ? (
+                        <div className="text-[11px] text-sky-400">
+                          Proxy 127.0.0.1:{site.port}
+                        </div>
+                      ) : null}
+                    </td>
+                    <td className="px-5 py-3.5">
+                      <StatusBadge tone="green" label="Enabled" dot />
+                    </td>
+                    <td className="px-5 py-3.5 text-right">
+                      {site.isPanel ? (
+                        <span className="text-xs text-slate-500">Protected</span>
+                      ) : site.type === 'dbonly' ? (
+                        <span
+                          className="text-xs text-slate-500"
+                          title="Managed by database lifecycle; delete on /databases or upgrade via Create Site"
+                        >
+                          Via Databases
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDeleteError(null);
+                            setDeleteTarget(site);
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition"
+                        >
+                          <IconTrash className="w-3.5 h-3.5" />
+                          <span>Delete</span>
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Create Site Modal */}
+      <Modal
+        open={createOpen}
+        title="Create Virtual Host"
+        subtitle="Creates Apache vhost, docroot /var/www/<name>, symlinks /db.php, and reloads Apache."
+        onClose={() => setCreateOpen(false)}
+      >
+        <form onSubmit={handleCreate} className="space-y-4">
+          {createError && (
+            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+              {createError}
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-medium text-slate-300 mb-1.5">
+              Site Name
+            </label>
+            <input
+              type="text"
+              autoFocus
+              required
+              placeholder="e.g. blog"
+              value={name}
+              onChange={(e) => setName(e.target.value.toLowerCase())}
+              className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-sm text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
+            />
+            {nameError && <p className="mt-1 text-xs text-rose-400">{nameError}</p>}
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-300 mb-1.5">
+              Runtime Type
+            </label>
+            <select
+              value={siteType}
+              onChange={(e) => setSiteType(e.target.value as SiteType)}
+              className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
+            >
+              <option value="static">static — HTML/CSS/JS (disables arbitrary PHP)</option>
+              <option value="php">php — Apache + PHP 8.x docroot</option>
+              <option value="nextjs">nextjs — Reverse proxy + systemd unit template</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-300 mb-1.5">
+              Custom Domain (optional)
+            </label>
+            <input
+              type="text"
+              placeholder={`${name || '<name>'}.${baseDomain}`}
+              value={customDomain}
+              onChange={(e) => setCustomDomain(e.target.value.toLowerCase())}
+              className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-sm text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
+            />
+            {domainError ? (
+              <p className="mt-1 text-xs text-rose-400">{domainError}</p>
+            ) : (
+              <p className="mt-1 text-xs text-slate-500">
+                Leave blank to use{' '}
+                <span className="font-mono text-slate-300">
+                  {name || '<name>'}.{baseDomain}
+                </span>
+              </p>
+            )}
+          </div>
+
+          {siteType === 'nextjs' && (
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                Internal Node Port (optional)
+              </label>
+              <input
+                type="number"
+                min={3001}
+                max={39999}
+                placeholder="Auto-assign (3100+)"
+                value={customPort}
+                onChange={(e) => setCustomPort(e.target.value)}
+                className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-sm text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
+              />
+              <p className="mt-1 text-xs text-slate-500">
+                Also creates <span className="font-mono">/etc/systemd/system/app-{name || '<name>'}.service</span>; excludes <span className="font-mono">/db.php</span> from ProxyPass.
+              </p>
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setCreateOpen(false)}
+              className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs font-medium text-slate-300 hover:text-white transition"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={!isFormValid || creating}
+              className="rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-accent-hover disabled:opacity-50 transition"
+            >
+              {creating ? 'Creating...' : 'Create Site'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Certbot TLS Modal */}
+      <Modal
+        open={certOpen}
+        title="Provision Let's Encrypt TLS Certificate"
+        subtitle="Runs certbot --apache -d <domain>. DNS A/AAAA record must already point to this server."
+        onClose={() => setCertOpen(false)}
+        maxWidthClass="max-w-xl"
+      >
+        <form onSubmit={handleCertSubmit} className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-slate-300 mb-1.5">
+              Managed Domain
+            </label>
+            <input
+              type="text"
+              required
+              value={certDomain}
+              onChange={(e) => setCertDomain(e.target.value.toLowerCase())}
+              placeholder={`app.${baseDomain}`}
+              className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-sm text-slate-100 focus:border-accent focus:outline-none"
+            />
+          </div>
+
+          <label className="flex items-center gap-2.5 text-xs text-slate-300 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={certDryRun}
+              onChange={(e) => setCertDryRun(e.target.checked)}
+              className="rounded border-borderline bg-canvas text-accent focus:ring-accent"
+            />
+            <span>Run with --dry-run (test validation without saving certificates)</span>
+          </label>
+
+          {certResult && (
+            <div className="space-y-2">
+              <StatusBadge
+                tone={certResult.ok ? 'green' : 'red'}
+                label={certResult.ok ? 'Certbot Succeeded' : 'Certbot Failed'}
+                dot
+              />
+              <pre className="max-h-56 overflow-auto rounded-lg border border-borderline bg-canvas p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">
+                {[certResult.stdout, certResult.stderr].filter(Boolean).join('\n') || 'No output'}
+              </pre>
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={() => setCertOpen(false)}
+              className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs font-medium text-slate-300 hover:text-white transition"
+            >
+              Close
+            </button>
+            <button
+              type="submit"
+              disabled={certRunning || !DOMAIN_RE.test(certDomain.trim())}
+              className="rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-accent-hover disabled:opacity-50 transition"
+            >
+              {certRunning ? 'Running Certbot...' : certDryRun ? 'Test Dry Run' : 'Issue Certificate'}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Delete Site Modal */}
+      <Modal
+        open={Boolean(deleteTarget)}
+        title="Archive Site"
+        subtitle="Disables Apache virtual host and archives docroot to /srv/backups/sites/."
+        onClose={() => setDeleteTarget(null)}
+      >
+        {deleteTarget && (
+          <div className="space-y-4">
+            {deleteError && (
+              <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+                {deleteError}
+              </div>
+            )}
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Are you sure you want to disable{' '}
+              <span className="font-mono font-semibold text-slate-100">
+                {deleteTarget.serverName}
+              </span>{' '}
+              and archive <span className="font-mono">{deleteTarget.docroot}</span>?
+              {deleteTarget.hasDb && (
+                <span className="block mt-2 text-amber-300">
+                  Note: SQLite data in /srv/db/{deleteTarget.name} will be preserved.
+                </span>
+              )}
+            </p>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeleteTarget(null)}
+                className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs font-medium text-slate-300 hover:text-white transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={handleDelete}
+                className="rounded-lg bg-rose-600 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-500 disabled:opacity-40 transition"
+              >
+                {deleting ? 'Archiving...' : 'Archive Site'}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}

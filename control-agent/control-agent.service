@@ -1,0 +1,20 @@
+[Unit]
+Description=DietPi Panel Privileged Control Agent
+After=network.target apache2.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=control-agent
+EnvironmentFile=/etc/control-agent/config.env
+Environment=AGENT_SECRET=
+Environment=AGENT_SOCKET=/run/control-agent.sock
+Environment=SOCKET_GROUP=panel
+Environment=AGENT_LOG=/var/log/control-agent.log
+ExecStart=/usr/bin/env node /opt/control-agent/agent.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

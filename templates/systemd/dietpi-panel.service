@@ -1,0 +1,25 @@
+[Unit]
+Description=DietPi Panel Next.js Web Dashboard
+After=network.target control-agent.service
+Wants=control-agent.service
+
+[Service]
+Type=simple
+User=panel
+Group=panel
+WorkingDirectory=/opt/dietpi-panel
+EnvironmentFile=/etc/dietpi-panel/panel.env
+Environment=HOME=/tmp
+ExecStart=/usr/bin/env node /opt/dietpi-panel/node_modules/next/dist/bin/next start -H 127.0.0.1 -p 3000
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/db/_panel
+
+[Install]
+WantedBy=multi-user.target

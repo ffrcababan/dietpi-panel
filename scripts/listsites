@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# listsites
+# Parses enabled Apache virtual hosts and outputs a JSON array of
+# {name, serverName, docroot, type, ssl, port, hasDb, isPanel}.
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/}"
+    s="${s//$'\r'/}"
+    s="${s//$'\t'/}"
+    printf '%s' "$s"
+}
+
+shopt -s nullglob
+enabled_files=(/etc/apache2/sites-enabled/*.conf)
+shopt -u nullglob
+
+# Collect all domains that have an enabled SSL vhost (*-le-ssl.conf or SSLEngine on)
+ssl_domains=" "
+for f in "${enabled_files[@]}"; do
+    base="${f##*/}"
+    if [[ "$base" == "000-default.conf" || "$base" == "default-ssl.conf" ]]; then
+        continue
+    fi
+    if grep -qiE '^\s*SSLEngine\s+on\b' "$f"; then
+        sn="$(awk 'tolower($1)=="servername" {print tolower($2); exit}' "$f" || true)"
+        if [[ -n "$sn" ]]; then
+            ssl_domains+="${sn} "
+        fi
+    fi
+done
+
+printf '['
+first=1
+for f in "${enabled_files[@]}"; do
+    base="${f##*/}"
+    if [[ "$base" == "000-default.conf" || "$base" == "default-ssl.conf" || "$base" == *-le-ssl.conf ]]; then
+        continue
+    fi
+
+    stem="${base%.conf}"
+    name="$(sed -n 's/^# dietpi-panel:name=\([a-z0-9-]*\)$/\1/p' "$f" | head -n1 || true)"
+    if [[ -z "$name" ]]; then
+        name="$stem"
+    fi
+
+    site_type="$(sed -n 's/^# dietpi-panel:type=\([a-z0-9-]*\)$/\1/p' "$f" | head -n1 || true)"
+    if [[ -z "$site_type" ]]; then
+        site_type="custom"
+    fi
+
+    port_val="$(sed -n 's/^# dietpi-panel:port=\([0-9]*\)$/\1/p' "$f" | head -n1 || true)"
+    if [[ -z "$port_val" ]]; then
+        port_json="null"
+    else
+        port_json="$port_val"
+    fi
+
+    server_name="$(awk 'tolower($1)=="servername" {print $2; exit}' "$f" || true)"
+    docroot="$(awk 'tolower($1)=="documentroot" {print $2; exit}' "$f" || true)"
+    if [[ -z "$server_name" ]]; then
+        server_name="$stem"
+    fi
+    if [[ -z "$docroot" ]]; then
+        if [[ "$site_type" == "panel" ]]; then
+            docroot="http://127.0.0.1:3000"
+        else
+            docroot="/var/www/${name}"
+        fi
+    fi
+
+    sn_lower="$(printf '%s' "$server_name" | tr '[:upper:]' '[:lower:]')"
+    ssl_flag="false"
+    if [[ -e "/etc/apache2/sites-enabled/${stem}-le-ssl.conf" || "$ssl_domains" == *" ${sn_lower} "* ]]; then
+        ssl_flag="true"
+    fi
+
+    has_db="false"
+    if [[ -f "/srv/db/${name}/data.sqlite" ]]; then
+        has_db="true"
+    fi
+
+    is_panel="false"
+    if [[ "$name" == "dietpi-panel" || "$site_type" == "panel" ]]; then
+        is_panel="true"
+    fi
+
+    if [[ $first -eq 0 ]]; then
+        printf ','
+    fi
+    first=0
+
+    printf '{"name":"%s","serverName":"%s","docroot":"%s","type":"%s","ssl":%s,"port":%s,"hasDb":%s,"isPanel":%s}' \
+        "$(json_escape "$name")" \
+        "$(json_escape "$server_name")" \
+        "$(json_escape "$docroot")" \
+        "$(json_escape "$site_type")" \
+        "$ssl_flag" \
+        "$port_json" \
+        "$has_db" \
+        "$is_panel"
+done
+printf ']\n'

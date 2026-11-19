@@ -1,0 +1,21 @@
+# Environment & secrets
+.env
+.env.local
+.env*.local
+*.env
+
+# Node / Next.js
+node_modules/
+dietpi-panel/node_modules/
+dietpi-panel/.next/
+dietpi-panel/out/
+dietpi-panel/next-env.d.ts
+*.tsbuildinfo
+
+# Local test artifacts / logs
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+.DS_Store
+Thumbs.db

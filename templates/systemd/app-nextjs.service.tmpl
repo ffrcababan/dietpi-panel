@@ -1,0 +1,21 @@
+[Unit]
+Description=Next.js App (__NAME__)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/__NAME__
+Environment=NODE_ENV=production
+Environment=PORT=__PORT__
+Environment=HOSTNAME=127.0.0.1
+ExecStart=/usr/bin/env npm run start
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

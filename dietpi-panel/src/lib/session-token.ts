@@ -3,6 +3,7 @@ export const SESSION_COOKIE_NAME = 'dp_session';
 export interface SessionPayload {
   sub: number;
   username: string;
+  role?: 'admin' | 'user';
   ver: number;
   csrf: string;
   stage: 'full' | 'totp_pending';
@@ -103,6 +104,7 @@ export async function verifySessionToken(
       !parsed ||
       typeof parsed.sub !== 'number' ||
       typeof parsed.username !== 'string' ||
+      (parsed.role !== undefined && parsed.role !== 'admin' && parsed.role !== 'user') ||
       typeof parsed.ver !== 'number' ||
       typeof parsed.csrf !== 'string' ||
       (parsed.stage !== 'full' && parsed.stage !== 'totp_pending') ||

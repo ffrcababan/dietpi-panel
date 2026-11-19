@@ -7,6 +7,8 @@ const PUBLIC_API_PATHS = new Set([
   '/api/health',
 ]);
 
+const ADMIN_ONLY_PAGE_PREFIXES = ['/users', '/services', '/logs'];
+
 function buildRedirectUrl(request: NextRequest, targetPath: string): URL {
   const rawHost =
     request.headers.get('x-forwarded-host') ||
@@ -46,7 +48,7 @@ export async function middleware(request: NextRequest) {
 
   if (pathname === '/login') {
     if (isAuthenticated && payload) {
-      const dest = payload.mustChangePassword ? '/settings' : '/';
+      const dest = payload.mustChangePassword ? '/account' : '/';
       return noStoreRedirect(request, dest);
     }
     return NextResponse.next();
@@ -66,8 +68,19 @@ export async function middleware(request: NextRequest) {
     return noStoreRedirect(request, '/login');
   }
 
-  if (payload.mustChangePassword && pathname !== '/settings') {
-    return noStoreRedirect(request, '/settings');
+  if (
+    payload.mustChangePassword &&
+    pathname !== '/account' &&
+    pathname !== '/settings'
+  ) {
+    return noStoreRedirect(request, '/account');
+  }
+
+  if (
+    payload.role === 'user' &&
+    ADMIN_ONLY_PAGE_PREFIXES.some((prefix) => pathname.startsWith(prefix))
+  ) {
+    return noStoreRedirect(request, '/');
   }
 
   return NextResponse.next();

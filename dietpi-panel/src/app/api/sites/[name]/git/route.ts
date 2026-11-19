@@ -4,7 +4,7 @@ import {
   parseAgentJson,
   type SiteBuildRecord,
 } from '@/lib/agent';
-import { requireAdmin } from '@/lib/auth';
+import { requireResourceAccess } from '@/lib/auth';
 import {
   validateGitBranch,
   validateGitUrl,
@@ -29,10 +29,14 @@ export async function GET(
   _request: Request,
   context: { params: { name: string } }
 ) {
-  const auth = await requireAdmin();
+  const nameCheck = validateResourceName(context.params.name, 'site name');
+  const auth = await requireResourceAccess(
+    undefined,
+    'site',
+    nameCheck.ok ? nameCheck.value : ''
+  );
   if (!auth.ok) return auth.response;
 
-  const nameCheck = validateResourceName(context.params.name, 'site name');
   if (!nameCheck.ok) {
     return NextResponse.json({ error: nameCheck.error }, { status: 400 });
   }
@@ -62,10 +66,14 @@ export async function POST(
   request: Request,
   context: { params: { name: string } }
 ) {
-  const auth = await requireAdmin(request);
+  const nameCheck = validateResourceName(context.params.name, 'site name');
+  const auth = await requireResourceAccess(
+    request,
+    'site',
+    nameCheck.ok ? nameCheck.value : ''
+  );
   if (!auth.ok) return auth.response;
 
-  const nameCheck = validateResourceName(context.params.name, 'site name');
   if (!nameCheck.ok) {
     return NextResponse.json({ error: nameCheck.error }, { status: 400 });
   }

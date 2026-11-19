@@ -32,9 +32,10 @@ export async function apiFetcher<T>(url: string): Promise<T> {
       res.status === 403 &&
       data.code === 'PASSWORD_CHANGE_REQUIRED' &&
       typeof window !== 'undefined' &&
+      window.location.pathname !== '/account' &&
       window.location.pathname !== '/settings'
     ) {
-      window.location.href = '/settings';
+      window.location.href = '/account';
     }
     throw new ApiError(
       data.error || `Request failed (${res.status})`,

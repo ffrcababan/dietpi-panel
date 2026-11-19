@@ -1,9 +1,11 @@
 'use client';
 
 import React, { useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { IconCheck, IconCopy, IconLock, IconShield } from '@/components/Icons';
+import { IconCheck, IconCopy, IconLock, IconShield, IconUser, IconUsers } from '@/components/Icons';
 import { usePanel } from '@/components/PanelContext';
+import { PasswordInput } from '@/components/PasswordInput';
 import { StatusBadge } from '@/components/StatusBadge';
 import { apiMutate } from '@/lib/client-api';
 
@@ -166,13 +168,33 @@ export default function SettingsPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-100">
-          Settings &amp; Security
-        </h1>
-        <p className="mt-1 text-sm text-slate-400">
-          Manage administrator password, TOTP two-factor authentication, and control agent status.
-        </p>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-100">
+            Settings &amp; Security
+          </h1>
+          <p className="mt-1 text-sm text-slate-400">
+            Manage password, TOTP two-factor authentication{me?.role === 'admin' ? ', users, and control agent diagnostics' : ''}.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Link
+            href="/account"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-borderline bg-surface px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-slate-500 transition"
+          >
+            <IconUser className="w-3.5 h-3.5" />
+            <span>My Account Profile</span>
+          </Link>
+          {me?.role === 'admin' && (
+            <Link
+              href="/users"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-accent-hover transition"
+            >
+              <IconUsers className="w-3.5 h-3.5" />
+              <span>Manage Users</span>
+            </Link>
+          )}
+        </div>
       </div>
 
       {me?.mustChangePassword && (
@@ -206,13 +228,11 @@ export default function SettingsPage() {
               <label className="block text-xs font-medium text-slate-300 mb-1">
                 Current Password
               </label>
-              <input
-                type="password"
+              <PasswordInput
                 autoComplete="current-password"
                 required
                 value={currentPassword}
                 onChange={(e) => setCurrentPassword(e.target.value)}
-                className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
               />
             </div>
 
@@ -220,14 +240,12 @@ export default function SettingsPage() {
               <label className="block text-xs font-medium text-slate-300 mb-1">
                 New Password (min 12 characters)
               </label>
-              <input
-                type="password"
+              <PasswordInput
                 autoComplete="new-password"
                 required
                 minLength={12}
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
-                className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
               />
             </div>
 
@@ -235,14 +253,12 @@ export default function SettingsPage() {
               <label className="block text-xs font-medium text-slate-300 mb-1">
                 Confirm New Password
               </label>
-              <input
-                type="password"
+              <PasswordInput
                 autoComplete="new-password"
                 required
                 minLength={12}
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
-                className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
               />
             </div>
 
@@ -297,12 +313,10 @@ export default function SettingsPage() {
                 <label className="block text-xs font-medium text-slate-300 mb-1">
                   Current Password
                 </label>
-                <input
-                  type="password"
+                <PasswordInput
                   required
                   value={disablePw}
                   onChange={(e) => setDisablePw(e.target.value)}
-                  className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
                 />
               </div>
               <div>
@@ -415,39 +429,40 @@ export default function SettingsPage() {
         </section>
       </div>
 
-      {/* Control Agent Connection Diagnostics */}
-      <section className="rounded-xl border border-borderline bg-surface p-6">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <h2 className="text-base font-semibold text-slate-100">
-              Control Agent &amp; Architecture Status
-            </h2>
-            <p className="mt-1 text-xs text-slate-400">
-              Unprivileged panel UI communicates exclusively via authenticated Unix domain socket.
-            </p>
+      {me?.role === 'admin' && (
+        <section className="rounded-xl border border-borderline bg-surface p-6">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="text-base font-semibold text-slate-100">
+                Control Agent &amp; Architecture Status
+              </h2>
+              <p className="mt-1 text-xs text-slate-400">
+                Unprivileged panel UI communicates exclusively via authenticated Unix domain socket.
+              </p>
+            </div>
+            <StatusBadge
+              tone={me?.agentConnected ? 'green' : 'red'}
+              label={me?.agentConnected ? 'Socket Connected' : 'Socket Disconnected'}
+              dot
+            />
           </div>
-          <StatusBadge
-            tone={me?.agentConnected ? 'green' : 'red'}
-            label={me?.agentConnected ? 'Socket Connected' : 'Socket Disconnected'}
-            dot
-          />
-        </div>
 
-        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3 text-xs font-mono">
-          <div className="rounded-lg border border-borderline bg-canvas p-3">
-            <div className="text-slate-500">Unix Socket</div>
-            <div className="mt-1 text-slate-200">/run/control-agent.sock</div>
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3 text-xs font-mono">
+            <div className="rounded-lg border border-borderline bg-canvas p-3">
+              <div className="text-slate-500">Unix Socket</div>
+              <div className="mt-1 text-slate-200">/run/control-agent.sock</div>
+            </div>
+            <div className="rounded-lg border border-borderline bg-canvas p-3">
+              <div className="text-slate-500">Base Domain</div>
+              <div className="mt-1 text-slate-200">{me?.baseDomain || '—'}</div>
+            </div>
+            <div className="rounded-lg border border-borderline bg-canvas p-3">
+              <div className="text-slate-500">Panel Auth DB</div>
+              <div className="mt-1 text-slate-200">/srv/db/_panel/panel.sqlite</div>
+            </div>
           </div>
-          <div className="rounded-lg border border-borderline bg-canvas p-3">
-            <div className="text-slate-500">Base Domain</div>
-            <div className="mt-1 text-slate-200">{me?.baseDomain || '—'}</div>
-          </div>
-          <div className="rounded-lg border border-borderline bg-canvas p-3">
-            <div className="text-slate-500">Panel Auth DB</div>
-            <div className="mt-1 text-slate-200">/srv/db/_panel/panel.sqlite</div>
-          </div>
-        </div>
-      </section>
+        </section>
+      )}
     </div>
   );
 }

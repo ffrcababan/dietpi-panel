@@ -2,10 +2,11 @@
 
 import React, { useState } from 'react';
 import { IconLock, IconShield } from '@/components/Icons';
+import { PasswordInput } from '@/components/PasswordInput';
 
 export default function LoginPage() {
   const [step, setStep] = useState<'password' | 'totp'>('password');
-  const [username, setUsername] = useState('admin');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [totpCode, setTotpCode] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -40,7 +41,7 @@ export default function LoginPage() {
         return;
       }
 
-      window.location.assign(data.mustChangePassword ? '/settings' : '/');
+      window.location.assign(data.mustChangePassword ? '/account' : '/');
     } catch {
       setError('Unable to reach server');
     } finally {
@@ -70,7 +71,7 @@ export default function LoginPage() {
         return;
       }
 
-      window.location.assign(data.mustChangePassword ? '/settings' : '/');
+      window.location.assign(data.mustChangePassword ? '/account' : '/');
     } catch {
       setError('Unable to verify 2FA code');
     } finally {
@@ -110,7 +111,9 @@ export default function LoginPage() {
               <input
                 type="text"
                 autoComplete="username"
+                autoFocus
                 required
+                placeholder="admin"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
@@ -121,13 +124,12 @@ export default function LoginPage() {
               <label className="block text-xs font-medium text-slate-300 mb-1.5">
                 Password
               </label>
-              <input
-                type="password"
+              <PasswordInput
                 autoComplete="current-password"
                 required
+                placeholder="Enter your password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
               />
             </div>
 

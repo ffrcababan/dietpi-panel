@@ -2,7 +2,12 @@ import crypto from 'node:crypto';
 import { cookies } from 'next/headers';
 import { NextResponse } from 'next/server';
 import { constantTimeEqual } from './crypto';
-import { getUserById, type UserRow } from './db';
+import {
+  getUserById,
+  isResourceOwner,
+  type ResourceType,
+  type UserRow,
+} from './db';
 import {
   SESSION_COOKIE_NAME,
   signSessionToken,
@@ -37,6 +42,7 @@ export async function issueSessionCookie(
   const payload: SessionPayload = {
     sub: user.id,
     username: user.username,
+    role: user.role === 'admin' ? 'admin' : 'user',
     ver: user.session_version,
     csrf: csrfOverride || crypto.randomBytes(24).toString('hex'),
     stage,
@@ -77,13 +83,13 @@ export async function getPendingTotpSession(): Promise<{
     return null;
   }
   const user = await getUserById(payload.sub);
-  if (!user || user.session_version !== payload.ver) {
+  if (!user || user.session_version !== payload.ver || user.is_active !== 1) {
     return null;
   }
   return { user, payload };
 }
 
-export type AdminAuthResult =
+export type AuthResult =
   | {
       ok: true;
       user: UserRow;
@@ -94,10 +100,12 @@ export type AdminAuthResult =
       response: NextResponse;
     };
 
-export async function requireAdmin(
+export type AdminAuthResult = AuthResult;
+
+export async function requireSession(
   request?: Request,
   options: { allowPendingPasswordChange?: boolean } = {}
-): Promise<AdminAuthResult> {
+): Promise<AuthResult> {
   let secret: string;
   try {
     secret = getSessionSecret();
@@ -128,6 +136,16 @@ export async function requireAdmin(
     };
   }
 
+  if (user.is_active !== 1) {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: 'This account has been suspended' },
+        { status: 403 }
+      ),
+    };
+  }
+
   if (request && MUTATING_METHODS.has(request.method.toUpperCase())) {
     const csrfHeader = request.headers.get('x-panel-csrf') || '';
     if (!csrfHeader || !constantTimeEqual(csrfHeader, payload.csrf)) {
@@ -146,7 +164,7 @@ export async function requireAdmin(
       ok: false,
       response: NextResponse.json(
         {
-          error: 'Password change required on first login',
+          error: 'Password change required before accessing panel features',
           code: 'PASSWORD_CHANGE_REQUIRED',
         },
         { status: 403 }
@@ -155,4 +173,49 @@ export async function requireAdmin(
   }
 
   return { ok: true, user, payload };
+}
+
+export async function requireAdmin(
+  request?: Request,
+  options: { allowPendingPasswordChange?: boolean } = {}
+): Promise<AuthResult> {
+  const session = await requireSession(request, options);
+  if (!session.ok) return session;
+  if (session.user.role !== 'admin') {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: 'Administrator privileges required' },
+        { status: 403 }
+      ),
+    };
+  }
+  return session;
+}
+
+export async function requireResourceAccess(
+  request: Request | undefined,
+  resourceType: ResourceType,
+  resourceName: string,
+  options: { allowPendingPasswordChange?: boolean } = {}
+): Promise<AuthResult> {
+  const session = await requireSession(request, options);
+  if (!session.ok) return session;
+
+  if (session.user.role === 'admin') {
+    return session;
+  }
+
+  const owned = await isResourceOwner(resourceType, resourceName, session.user.id);
+  if (!owned) {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: `Access denied: you do not have permission to access this ${resourceType}` },
+        { status: 403 }
+      ),
+    };
+  }
+
+  return session;
 }

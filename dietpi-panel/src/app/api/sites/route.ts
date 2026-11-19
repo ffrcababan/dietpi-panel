@@ -4,7 +4,13 @@ import {
   parseAgentJson,
   type TunnelActionResult,
 } from '@/lib/agent';
-import { requireAdmin } from '@/lib/auth';
+import { requireSession } from '@/lib/auth';
+import {
+  getAllResourceOwnerMap,
+  getOwnedResourceNames,
+  getResourceOwner,
+  setResourceOwner,
+} from '@/lib/db';
 import {
   FRAMEWORK_PRESETS,
   validateDomainName,
@@ -30,6 +36,7 @@ export interface SiteRecord {
   isPanel: boolean;
   tunnel?: boolean;
   watch?: boolean;
+  ownerUsername?: string | null;
 }
 
 export interface CreateSiteResponse {
@@ -53,13 +60,28 @@ export interface CreateSiteResponse {
 }
 
 export async function GET() {
-  const auth = await requireAdmin();
+  const auth = await requireSession();
   if (!auth.ok) return auth.response;
 
   try {
     const resp = await callControlAgent('site.list');
-    const sites = parseAgentJson<SiteRecord[]>(resp, 'Failed to list sites');
-    return NextResponse.json({ sites }, { headers: NO_STORE_HEADERS });
+    const allSites = parseAgentJson<SiteRecord[]>(resp, 'Failed to list sites');
+
+    if (auth.user.role === 'admin') {
+      const ownerMap = await getAllResourceOwnerMap('site');
+      const sites = allSites.map((s) => ({
+        ...s,
+        ownerUsername: ownerMap.get(s.name)?.ownerUsername ?? null,
+      }));
+      return NextResponse.json({ sites }, { headers: NO_STORE_HEADERS });
+    }
+
+    const ownedNames = await getOwnedResourceNames('site', auth.user.id);
+    const scopedSites = allSites
+      .filter((s) => !s.isPanel && s.type !== 'dbonly' && ownedNames.has(s.name))
+      .map((s) => ({ ...s, ownerUsername: auth.user.username }));
+
+    return NextResponse.json({ sites: scopedSites }, { headers: NO_STORE_HEADERS });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : 'Failed to list sites' },
@@ -69,7 +91,7 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const auth = await requireAdmin(request);
+  const auth = await requireSession(request);
   if (!auth.ok) return auth.response;
 
   let body: {
@@ -127,6 +149,51 @@ export async function POST(request: Request) {
   const watch = Boolean(body.watch);
 
   try {
+    const [existingSiteOwner, existingDbOwner, sitesResp, dbsResp] =
+      await Promise.all([
+        getResourceOwner('site', nameCheck.value),
+        getResourceOwner('database', nameCheck.value),
+        callControlAgent('site.list'),
+        callControlAgent('db.list'),
+      ]);
+
+    const currentSites = sitesResp.ok
+      ? parseAgentJson<SiteRecord[]>(sitesResp, 'Failed to verify site availability')
+      : [];
+    const currentDbs = dbsResp.ok
+      ? parseAgentJson<Array<{ name: string }>>(dbsResp, 'Failed to verify DB availability')
+      : [];
+
+    if (currentSites.some((s) => s.name === nameCheck.value && s.type !== 'dbonly')) {
+      return NextResponse.json(
+        { error: `Site "${nameCheck.value}" already exists` },
+        { status: 409 }
+      );
+    }
+
+    if (
+      auth.user.role !== 'admin' &&
+      existingSiteOwner &&
+      existingSiteOwner.owner_user_id !== auth.user.id
+    ) {
+      return NextResponse.json(
+        { error: 'This site name is already registered to another user' },
+        { status: 403 }
+      );
+    }
+
+    const dbExistsOnDisk = currentDbs.some((d) => d.name === nameCheck.value);
+    if (
+      auth.user.role !== 'admin' &&
+      ((existingDbOwner && existingDbOwner.owner_user_id !== auth.user.id) ||
+        (dbExistsOnDisk && existingDbOwner?.owner_user_id !== auth.user.id))
+    ) {
+      return NextResponse.json(
+        { error: 'This name conflicts with an existing database owned by another user' },
+        { status: 403 }
+      );
+    }
+
     const resp = await callControlAgent('site.create', {
       name: nameCheck.value,
       type: typeCheck.value,
@@ -145,6 +212,12 @@ export async function POST(request: Request) {
       resp,
       'Invalid create site response'
     );
+
+    await setResourceOwner('site', site.name, auth.user.id);
+    if (site.database && !site.existingDb) {
+      await setResourceOwner('database', site.database.name, auth.user.id);
+    }
+
     return NextResponse.json({ site }, { status: 201, headers: NO_STORE_HEADERS });
   } catch (err) {
     return NextResponse.json(

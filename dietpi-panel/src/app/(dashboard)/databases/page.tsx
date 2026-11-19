@@ -24,7 +24,7 @@ export default function DatabasesPage() {
   const { data, error, mutate } = useSWR<{ databases: DatabaseRecord[] }>(
     '/api/databases',
     apiFetcher,
-    { refreshInterval: 5000 }
+    { refreshInterval: 5000, keepPreviousData: true }
   );
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -184,7 +184,12 @@ export default function DatabasesPage() {
                 databases.map((db) => (
                   <tr key={db.name} className="hover:bg-elevated/40">
                     <td className="px-5 py-3.5 font-mono font-medium text-slate-100">
-                      {db.name}
+                      <div>{db.name}</div>
+                      {me?.role === 'admin' && db.ownerUsername && (
+                        <div className="mt-0.5 text-[11px] font-normal text-slate-500">
+                          @{db.ownerUsername}
+                        </div>
+                      )}
                     </td>
                     <td className="px-5 py-3.5 font-mono text-xs text-slate-300">
                       https://{db.domain}/db.php

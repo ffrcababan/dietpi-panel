@@ -3,9 +3,14 @@
 import React, { createContext, useContext } from 'react';
 import useSWR from 'swr';
 import { apiFetcher } from '@/lib/client-api';
+import type { UserRole } from '@/lib/validation';
 
 export interface MeData {
+  id: number;
   username: string;
+  displayName: string;
+  email: string;
+  role: UserRole;
   csrfToken: string;
   mustChangePassword: boolean;
   totpEnabled: boolean;

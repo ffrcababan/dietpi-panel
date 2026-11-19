@@ -29,7 +29,7 @@ export default function SitesPage() {
   const { data, error, mutate } = useSWR<{ sites: SiteRecord[] }>(
     '/api/sites',
     apiFetcher,
-    { refreshInterval: 5000 }
+    { refreshInterval: 5000, keepPreviousData: true }
   );
 
   const [createOpen, setCreateOpen] = useState(false);
@@ -353,6 +353,9 @@ export default function SitesPage() {
                         <span>{site.name}</span>
                         {site.hasDb && <span className="text-sky-400">• SQLite</span>}
                         {site.watch && <span className="text-emerald-400">• Watch ON</span>}
+                        {me?.role === 'admin' && site.ownerUsername && (
+                          <span className="font-mono text-slate-400">• @{site.ownerUsername}</span>
+                        )}
                       </div>
                     </td>
                     <td className="px-5 py-3.5">

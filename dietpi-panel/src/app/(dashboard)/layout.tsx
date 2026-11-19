@@ -1,6 +1,6 @@
 import { redirect } from 'next/navigation';
 import { PanelShell } from '@/components/PanelShell';
-import { requireAdmin } from '@/lib/auth';
+import { requireSession } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 
@@ -9,7 +9,7 @@ export default async function DashboardLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const auth = await requireAdmin(undefined, { allowPendingPasswordChange: true });
+  const auth = await requireSession(undefined, { allowPendingPasswordChange: true });
   if (!auth.ok) {
     redirect('/login');
   }
@@ -17,7 +17,11 @@ export default async function DashboardLayout({
   return (
     <PanelShell
       initialMe={{
+        id: auth.user.id,
         username: auth.user.username,
+        displayName: auth.user.display_name,
+        email: auth.user.email,
+        role: auth.user.role,
         csrfToken: auth.payload.csrf,
         mustChangePassword: auth.user.must_change_password === 1,
         totpEnabled: Boolean(auth.user.totp_secret),

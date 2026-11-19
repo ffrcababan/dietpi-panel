@@ -1,13 +1,13 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
-import { issueSessionCookie, requireAdmin } from '@/lib/auth';
+import { issueSessionCookie, requireSession } from '@/lib/auth';
 import { hashPassword, verifyPassword } from '@/lib/crypto';
 import { updateUserPassword } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
-  const auth = await requireAdmin(request, { allowPendingPasswordChange: true });
+  const auth = await requireSession(request, { allowPendingPasswordChange: true });
   if (!auth.ok) return auth.response;
 
   let body: { currentPassword?: unknown; newPassword?: unknown };

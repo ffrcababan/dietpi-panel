@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import QRCode from 'qrcode';
-import { getSessionSecret, requireAdmin } from '@/lib/auth';
+import { getSessionSecret, requireSession } from '@/lib/auth';
 import {
   buildOtpAuthUri,
   constantTimeEqual,
@@ -62,7 +62,7 @@ function verifySetupToken(token: string, userId: number): string | null {
 }
 
 export async function POST(request: Request) {
-  const auth = await requireAdmin(request);
+  const auth = await requireSession(request);
   if (!auth.ok) return auth.response;
 
   let body: { action?: unknown; setupToken?: unknown; code?: unknown };
@@ -120,7 +120,7 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const auth = await requireAdmin(request);
+  const auth = await requireSession(request);
   if (!auth.ok) return auth.response;
 
   let body: { currentPassword?: unknown; code?: unknown };

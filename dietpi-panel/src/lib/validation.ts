@@ -225,3 +225,68 @@ export function validateGitBranch(
   }
   return { ok: true, value: val };
 }
+
+export const USERNAME_RE = /^[a-z][a-z0-9._-]{2,31}$/;
+export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+export type UserRole = 'admin' | 'user';
+
+export function validateUsername(
+  raw: unknown
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof raw !== 'string') {
+    return { ok: false, error: 'Username must be a string' };
+  }
+  const value = raw.trim().toLowerCase();
+  if (!USERNAME_RE.test(value)) {
+    return {
+      ok: false,
+      error:
+        'Username must be 3-32 characters, start with a lowercase letter, and use only lowercase letters, digits, dots, underscores, or hyphens',
+    };
+  }
+  return { ok: true, value };
+}
+
+export function validateDisplayName(
+  raw: unknown
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) {
+    return { ok: true, value: '' };
+  }
+  if (typeof raw !== 'string') {
+    return { ok: false, error: 'Display name must be a string' };
+  }
+  const cleaned = raw.replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ').trim();
+  if (cleaned.length > 64) {
+    return { ok: false, error: 'Display name must be at most 64 characters' };
+  }
+  return { ok: true, value: cleaned };
+}
+
+export function validateEmail(
+  raw: unknown
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null || raw === '') {
+    return { ok: true, value: '' };
+  }
+  if (typeof raw !== 'string') {
+    return { ok: false, error: 'Email must be a string' };
+  }
+  const value = raw.trim().toLowerCase();
+  if (value === '') {
+    return { ok: true, value: '' };
+  }
+  if (value.length > 120 || !EMAIL_RE.test(value)) {
+    return { ok: false, error: 'Enter a valid email address (or leave blank)' };
+  }
+  return { ok: true, value };
+}
+
+export function validateUserRole(
+  raw: unknown
+): { ok: true; value: UserRole } | { ok: false; error: string } {
+  if (raw !== 'admin' && raw !== 'user') {
+    return { ok: false, error: 'Role must be admin or user' };
+  }
+  return { ok: true, value: raw };
+}

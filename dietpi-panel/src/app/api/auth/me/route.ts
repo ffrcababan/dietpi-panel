@@ -1,11 +1,11 @@
 import { NextResponse } from 'next/server';
 import { callControlAgent } from '@/lib/agent';
-import { requireAdmin } from '@/lib/auth';
+import { requireSession } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
-  const auth = await requireAdmin(undefined, { allowPendingPasswordChange: true });
+  const auth = await requireSession(undefined, { allowPendingPasswordChange: true });
   if (!auth.ok) return auth.response;
 
   let agentConnected = false;
@@ -18,7 +18,11 @@ export async function GET() {
 
   return NextResponse.json(
     {
+      id: auth.user.id,
       username: auth.user.username,
+      displayName: auth.user.display_name,
+      email: auth.user.email,
+      role: auth.user.role,
       csrfToken: auth.payload.csrf,
       mustChangePassword: auth.user.must_change_password === 1,
       totpEnabled: Boolean(auth.user.totp_secret),

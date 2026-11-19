@@ -49,6 +49,13 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid username or password' }, { status: 401 });
   }
 
+  if (user.is_active !== 1) {
+    return NextResponse.json(
+      { error: 'This account is suspended. Contact an administrator.' },
+      { status: 403 }
+    );
+  }
+
   if (user.totp_secret) {
     const res = NextResponse.json(
       { ok: true, requiresTotp: true },

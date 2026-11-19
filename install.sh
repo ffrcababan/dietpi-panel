@@ -188,6 +188,10 @@ PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'user',
+  is_active INTEGER NOT NULL DEFAULT 1,
   password_hash TEXT NOT NULL,
   totp_secret TEXT,
   must_change_password INTEGER NOT NULL DEFAULT 0,
@@ -195,6 +199,16 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS resource_owners (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  resource_type TEXT NOT NULL CHECK (resource_type IN ('site', 'database')),
+  resource_name TEXT NOT NULL,
+  owner_user_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(resource_type, resource_name),
+  FOREIGN KEY(owner_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_resource_owners_owner ON resource_owners(owner_user_id);
 SQL
 
 ADMIN_EXISTS="$(sqlite3 "$PANEL_DB" "SELECT COUNT(*) FROM users WHERE username='admin';")"
@@ -229,7 +243,7 @@ if [[ "$ADMIN_EXISTS" == "0" ]]; then
     ')"
 
     HASH_HEX="$(printf '%s' "$ADMIN_HASH" | od -An -tx1 | tr -d ' \n')"
-    sqlite3 "$PANEL_DB" "INSERT INTO users (username, password_hash, must_change_password) VALUES ('admin', CAST(X'${HASH_HEX}' AS TEXT), 1);"
+    sqlite3 "$PANEL_DB" "INSERT INTO users (username, display_name, role, is_active, password_hash, must_change_password) VALUES ('admin', 'Administrator', 'admin', 1, CAST(X'${HASH_HEX}' AS TEXT), 1);"
     unset ADMIN_PASS ADMIN_PASS_CONFIRM ADMIN_HASH
     log "Created initial admin user (must_change_password=1)."
 else

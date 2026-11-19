@@ -100,6 +100,7 @@ export async function POST(
       }
 
       const resp = await callControlAgent('files.uploadChunk', {
+        name: nameCheck.value,
         uploadId,
         contentBase64,
       });

@@ -7,7 +7,7 @@ const PUBLIC_API_PATHS = new Set([
   '/api/health',
 ]);
 
-const ADMIN_ONLY_PAGE_PREFIXES = ['/users', '/services', '/logs'];
+const ADMIN_ONLY_PAGE_PREFIXES = ['/users', '/services', '/logs', '/settings'];
 
 function buildRedirectUrl(request: NextRequest, targetPath: string): URL {
   const rawHost =
@@ -68,11 +68,7 @@ export async function middleware(request: NextRequest) {
     return noStoreRedirect(request, '/login');
   }
 
-  if (
-    payload.mustChangePassword &&
-    pathname !== '/account' &&
-    pathname !== '/settings'
-  ) {
+  if (payload.mustChangePassword && pathname !== '/account') {
     return noStoreRedirect(request, '/account');
   }
 

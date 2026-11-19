@@ -255,6 +255,7 @@ chmod 0640 "$PANEL_DB"
 
 # 8. Install and build Next.js panel app
 log "Copying Next.js application to /opt/dietpi-panel..."
+rm -rf /opt/dietpi-panel/src /opt/dietpi-panel/public /opt/dietpi-panel/.next
 tar --exclude=node_modules --exclude=.next -cf - -C "${REPO_DIR}/dietpi-panel" . | tar -xf - -C /opt/dietpi-panel
 
 log "Installing npm dependencies and building Next.js production bundle..."
@@ -293,6 +294,10 @@ if [[ ! -f "$PANEL_VHOST" ]]; then
     sed "s|__BASE_DOMAIN__|${TARGET_DOMAIN}|g" /etc/skel/vhost-panel.conf > "$PANEL_VHOST"
     chmod 0644 "$PANEL_VHOST"
 else
+    sed -i 's/^[[:space:]]*ProxyTimeout 120$/    ProxyTimeout 600/' "$PANEL_VHOST" || true
+    if [[ -f /etc/apache2/sites-available/dietpi-panel-le-ssl.conf ]]; then
+        sed -i 's/^[[:space:]]*ProxyTimeout 120$/    ProxyTimeout 600/' /etc/apache2/sites-available/dietpi-panel-le-ssl.conf || true
+    fi
     warn "${PANEL_VHOST} already exists; keeping existing Apache vhost configuration."
 fi
 
@@ -321,5 +326,5 @@ echo "  1. Ensure DNS A/AAAA for panel.${TARGET_DOMAIN} (and *.${TARGET_DOMAIN})
 echo "  2. Enable TLS (required for Secure session cookies):"
 echo "       sudo certbot --apache -d panel.${TARGET_DOMAIN}"
 echo "  3. Visit https://panel.${TARGET_DOMAIN}, sign in as 'admin', change your"
-echo "     initial password on /settings, and optionally enable TOTP 2FA."
+echo "     initial password on /account, and optionally enable TOTP 2FA."
 echo "------------------------------------------------------------------------"

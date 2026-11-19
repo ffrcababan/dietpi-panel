@@ -23,6 +23,8 @@ export interface GitStatus {
   remote: string;
   branch: string;
   status: string;
+  hasSavedToken?: boolean;
+  savedUsername?: string;
 }
 
 export async function GET(
@@ -82,6 +84,9 @@ export async function POST(
     action?: unknown;
     repoUrl?: unknown;
     branch?: unknown;
+    username?: unknown;
+    token?: unknown;
+    saveToken?: unknown;
     triggerBuild?: unknown;
   };
   try {
@@ -90,8 +95,40 @@ export async function POST(
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  if (body.action !== 'clone' && body.action !== 'pull') {
-    return NextResponse.json({ error: 'action must be clone or pull' }, { status: 400 });
+  if (
+    body.action !== 'clone' &&
+    body.action !== 'pull' &&
+    body.action !== 'clearToken'
+  ) {
+    return NextResponse.json(
+      { error: 'action must be clone, pull, or clearToken' },
+      { status: 400 }
+    );
+  }
+
+  if (body.action === 'clearToken') {
+    try {
+      const resp = await callControlAgent('site.git', {
+        name: nameCheck.value,
+        action: 'clearToken',
+      });
+      if (!resp.ok) {
+        return NextResponse.json(
+          { error: resp.stderr || 'Failed to remove saved token' },
+          { status: 400 }
+        );
+      }
+      const result = parseAgentJson<{ cleared: boolean }>(
+        resp,
+        'Invalid git clearToken response'
+      );
+      return NextResponse.json({ result }, { headers: NO_STORE_HEADERS });
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : 'Failed to remove token' },
+        { status: 502 }
+      );
+    }
   }
 
   const branchCheck = validateGitBranch(body.branch);
@@ -108,12 +145,45 @@ export async function POST(
     repoUrl = urlCheck.value;
   }
 
+  let username: string | undefined;
+  if (typeof body.username === 'string' && body.username.trim() !== '') {
+    const cleanUser = body.username.trim();
+    if (cleanUser.length > 128 || /[:\r\n\0]/.test(cleanUser)) {
+      return NextResponse.json(
+        { error: 'Invalid Git username' },
+        { status: 400 }
+      );
+    }
+    username = cleanUser;
+  }
+
+  let token: string | undefined;
+  if (typeof body.token === 'string' && body.token.trim() !== '') {
+    const cleanToken = body.token.trim();
+    if (cleanToken.length > 512 || /[\r\n\0]/.test(cleanToken)) {
+      return NextResponse.json(
+        { error: 'Invalid personal access token format' },
+        { status: 400 }
+      );
+    }
+    if (repoUrl && !repoUrl.toLowerCase().startsWith('https://')) {
+      return NextResponse.json(
+        { error: 'Personal access tokens require an https:// repository URL' },
+        { status: 400 }
+      );
+    }
+    token = cleanToken;
+  }
+
   try {
     const resp = await callControlAgent('site.git', {
       name: nameCheck.value,
       action: body.action,
       repoUrl,
       branch: branchCheck.value,
+      username,
+      token,
+      saveToken: Boolean(body.saveToken),
       triggerBuild: body.triggerBuild !== false,
     });
     if (!resp.ok) {
@@ -125,6 +195,7 @@ export async function POST(
     const result = parseAgentJson<{
       cloned?: boolean;
       pulled?: boolean;
+      hasSavedToken?: boolean;
       build?: SiteBuildRecord | null;
     }>(resp, 'Invalid git response');
     return NextResponse.json({ result }, { headers: NO_STORE_HEADERS });

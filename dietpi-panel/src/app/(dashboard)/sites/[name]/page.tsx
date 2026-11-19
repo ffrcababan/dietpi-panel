@@ -19,7 +19,7 @@ import {
 import { SiteDeployTab } from '@/components/sites/SiteDeployTab';
 import { SiteFileWorkspace } from '@/components/sites/SiteFileWorkspace';
 import type { SiteBuildRecord } from '@/lib/agent';
-import { apiFetcher, apiMutate } from '@/lib/client-api';
+import { apiFetcher, apiMutate, apiMutateWithStatus } from '@/lib/client-api';
 import { FRAMEWORK_PRESETS, type SiteType } from '@/lib/validation';
 import type { SiteBuildStatusResponse } from '@/app/api/sites/[name]/build/route';
 import type { FileEntry } from '@/app/api/sites/[name]/files/route';
@@ -72,6 +72,7 @@ export default function SiteWorkspacePage({
   const [extractZip, setExtractZip] = useState(true);
   const [uploadAutoBuild, setUploadAutoBuild] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<{
     percent: number;
     label: string;
@@ -86,6 +87,9 @@ export default function SiteWorkspacePage({
   // Git & Build state
   const [repoUrl, setRepoUrl] = useState('');
   const [branch, setBranch] = useState('');
+  const [gitUsername, setGitUsername] = useState('');
+  const [gitToken, setGitToken] = useState('');
+  const [saveGitToken, setSaveGitToken] = useState(true);
   const [gitAutoBuild, setGitAutoBuild] = useState(true);
   const [gitBusy, setGitBusy] = useState(false);
   const [buildBusy, setBuildBusy] = useState(false);
@@ -208,11 +212,6 @@ export default function SiteWorkspacePage({
       setNewFileOpen(false);
       await mutateFiles();
       await openFile(rel, true);
-    } catch (err) {
-      setBanner({
-        ok: false,
-        text: err instanceof Error ? err.message : 'Failed to create file',
-      });
     } finally {
       setCreatingFile(false);
     }
@@ -231,11 +230,6 @@ export default function SiteWorkspacePage({
       );
       setNewDirOpen(false);
       await mutateFiles();
-    } catch (err) {
-      setBanner({
-        ok: false,
-        text: err instanceof Error ? err.message : 'Failed to create folder',
-      });
     } finally {
       setCreatingDir(false);
     }
@@ -246,6 +240,7 @@ export default function SiteWorkspacePage({
     setUploadMode('files');
     setUploadFiles(prefillFiles);
     setUploadProgress(null);
+    setUploadError(null);
     setUploadOpen(true);
   }, []);
 
@@ -254,22 +249,19 @@ export default function SiteWorkspacePage({
     if (!me?.csrfToken || uploadPlan.validItems.length === 0) return;
 
     if (uploadPlan.invalidPaths.length > 0) {
-      setBanner({
-        ok: false,
-        text: `Unsupported characters in filename/path: ${uploadPlan.invalidPaths[0]}. Rename or package inside a clean .zip.`,
-      });
+      setUploadError(
+        `Unsupported characters in filename/path: ${uploadPlan.invalidPaths[0]}. Rename or package inside a clean .zip.`
+      );
       return;
     }
 
     if (uploadPlan.totalBytes > MAX_WEBAPP_UPLOAD_BYTES) {
-      setBanner({
-        ok: false,
-        text: 'Total upload size exceeds the 100 MB limit.',
-      });
+      setUploadError('Total upload size exceeds the 100 MB limit.');
       return;
     }
 
     setUploading(true);
+    setUploadError(null);
     setBanner(null);
     const totalBytes = Math.max(1, uploadPlan.totalBytes);
     let completedBytes = 0;
@@ -395,16 +387,20 @@ export default function SiteWorkspacePage({
           percent: 99,
           label: `Running ${siteType} build pipeline...`,
         });
-        const buildRes = await apiMutate<{
+        const buildRes = await apiMutateWithStatus<{
           ok: boolean;
           build: SiteBuildRecord | null;
         }>(`/api/sites/${encodeURIComponent(siteName)}/build`, 'POST', me.csrfToken, {});
-        finalBuild = buildRes.build;
+        finalBuild = buildRes.data.build ?? null;
+        if (!buildRes.ok && !finalBuild) {
+          throw new Error(buildRes.data.error || 'Build pipeline failed');
+        }
       }
 
       setUploadProgress({ percent: 100, label: 'Done' });
       setUploadOpen(false);
       setUploadFiles([]);
+      setUploadError(null);
       setUploadProgress(null);
 
       const summaryText = singleMode
@@ -420,10 +416,9 @@ export default function SiteWorkspacePage({
       await Promise.all([mutateFiles(), mutateBuild()]);
     } catch (err) {
       await Promise.all([mutateFiles(), mutateBuild()]);
-      setBanner({
-        ok: false,
-        text: err instanceof Error ? err.message : 'Upload failed',
-      });
+      const msg = err instanceof Error ? err.message : 'Upload failed';
+      setUploadError(msg);
+      setBanner({ ok: false, text: msg });
     } finally {
       setUploading(false);
       setUploadProgress(null);
@@ -432,52 +427,38 @@ export default function SiteWorkspacePage({
 
   const handleRename = async (toPath: string) => {
     if (!me?.csrfToken || !renameTarget) return;
-    try {
-      await apiMutate(
-        `/api/sites/${encodeURIComponent(siteName)}/files`,
-        'POST',
-        me.csrfToken,
-        {
-          op: 'rename',
-          fromPath: renameTarget.path,
-          toPath,
-        }
-      );
-      if (selectedFile === renameTarget.path) {
-        setSelectedFile(toPath);
+    await apiMutate(
+      `/api/sites/${encodeURIComponent(siteName)}/files`,
+      'POST',
+      me.csrfToken,
+      {
+        op: 'rename',
+        fromPath: renameTarget.path,
+        toPath,
       }
-      setRenameTarget(null);
-      await mutateFiles();
-    } catch (err) {
-      setBanner({
-        ok: false,
-        text: err instanceof Error ? err.message : 'Rename failed',
-      });
+    );
+    if (selectedFile === renameTarget.path) {
+      setSelectedFile(toPath);
     }
+    setRenameTarget(null);
+    await mutateFiles();
   };
 
   const handleDelete = async () => {
     if (!me?.csrfToken || !deleteTarget) return;
-    try {
-      await apiMutate(
-        `/api/sites/${encodeURIComponent(siteName)}/files`,
-        'POST',
-        me.csrfToken,
-        { op: 'delete', path: deleteTarget.path }
-      );
-      if (selectedFile === deleteTarget.path) {
-        setSelectedFile(null);
-        setFileContent('');
-        setSavedContent('');
-      }
-      setDeleteTarget(null);
-      await mutateFiles();
-    } catch (err) {
-      setBanner({
-        ok: false,
-        text: err instanceof Error ? err.message : 'Delete failed',
-      });
+    await apiMutate(
+      `/api/sites/${encodeURIComponent(siteName)}/files`,
+      'POST',
+      me.csrfToken,
+      { op: 'delete', path: deleteTarget.path }
+    );
+    if (selectedFile === deleteTarget.path) {
+      setSelectedFile(null);
+      setFileContent('');
+      setSavedContent('');
     }
+    setDeleteTarget(null);
+    await mutateFiles();
   };
 
   const handleFixPermissions = async () => {
@@ -533,11 +514,6 @@ export default function SiteWorkspacePage({
         text: `Updated /${res.result.path} to ${res.result.mode} (${res.result.updatedCount} item(s), owner www-data).`,
       });
       await mutateFiles();
-    } catch (err) {
-      setBanner({
-        ok: false,
-        text: err instanceof Error ? err.message : 'Failed to update permissions',
-      });
     } finally {
       setPermsBusy(false);
     }
@@ -548,22 +524,14 @@ export default function SiteWorkspacePage({
     setBuildBusy(true);
     setBanner(null);
     try {
-      const res = await fetch(`/api/sites/${encodeURIComponent(siteName)}/build`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-panel-csrf': me.csrfToken,
-        },
-      });
-      const json = (await res.json().catch(() => ({}))) as {
+      const { ok, data: json } = await apiMutateWithStatus<{
         ok?: boolean;
         error?: string;
-      };
+      }>(`/api/sites/${encodeURIComponent(siteName)}/build`, 'POST', me.csrfToken);
       setBanner({
-        ok: res.ok && Boolean(json.ok),
+        ok: ok && Boolean(json.ok),
         text:
-          res.ok && json.ok
+          ok && json.ok
             ? `Build pipeline completed for ${siteName}.`
             : json.error || 'Build pipeline failed — see step output below.',
       });
@@ -608,20 +576,40 @@ export default function SiteWorkspacePage({
   };
 
   const handleGitAction = useCallback(
-    async (action: 'clone' | 'pull') => {
+    async (action: 'clone' | 'pull' | 'clearToken') => {
       if (!me?.csrfToken || gitBusy) return;
       setGitBusy(true);
       setBanner(null);
       try {
+        if (action === 'clearToken') {
+          await apiMutate<{ result: { cleared: boolean } }>(
+            `/api/sites/${encodeURIComponent(siteName)}/git`,
+            'POST',
+            me.csrfToken,
+            { action: 'clearToken' }
+          );
+          setGitToken('');
+          setBanner({
+            ok: true,
+            text: 'Saved Git personal access token cleared from server.',
+          });
+          await mutateGit();
+          return;
+        }
+
         const res = await apiMutate<{
           result: { build?: SiteBuildRecord | null };
         }>(`/api/sites/${encodeURIComponent(siteName)}/git`, 'POST', me.csrfToken, {
           action,
           repoUrl: action === 'clone' ? repoUrl.trim() : undefined,
           branch: branch.trim() || undefined,
+          username: gitUsername.trim() || undefined,
+          token: gitToken.trim() || undefined,
+          saveToken: saveGitToken,
           triggerBuild: gitAutoBuild,
         });
         const b = res.result.build;
+        setGitToken('');
         setBanner({
           ok: b ? b.ok : true,
           text: `Git ${action} completed${b ? ` · build ${b.ok ? 'succeeded' : 'failed'}` : ''}.`,
@@ -636,7 +624,20 @@ export default function SiteWorkspacePage({
         setGitBusy(false);
       }
     },
-    [me?.csrfToken, gitBusy, siteName, repoUrl, branch, gitAutoBuild, mutateGit, mutateFiles, mutateBuild]
+    [
+      me?.csrfToken,
+      gitBusy,
+      siteName,
+      repoUrl,
+      branch,
+      gitUsername,
+      gitToken,
+      saveGitToken,
+      gitAutoBuild,
+      mutateGit,
+      mutateFiles,
+      mutateBuild,
+    ]
   );
 
   const handleRefreshFiles = useCallback(() => {
@@ -818,10 +819,16 @@ export default function SiteWorkspacePage({
               lastBuild={buildStatus?.lastBuild}
               repoUrl={repoUrl}
               branch={branch}
+              gitUsername={gitUsername}
+              gitToken={gitToken}
+              saveGitToken={saveGitToken}
               gitAutoBuild={gitAutoBuild}
               gitBusy={gitBusy}
               onChangeRepoUrl={setRepoUrl}
               onChangeBranch={setBranch}
+              onChangeGitUsername={setGitUsername}
+              onChangeGitToken={setGitToken}
+              onChangeSaveGitToken={setSaveGitToken}
               onChangeGitAutoBuild={setGitAutoBuild}
               onGitAction={handleGitAction}
             />
@@ -861,7 +868,11 @@ export default function SiteWorkspacePage({
         uploadAutoBuild={uploadAutoBuild}
         uploading={uploading}
         uploadProgress={uploadProgress}
-        onClose={() => setUploadOpen(false)}
+        uploadError={uploadError}
+        onClose={() => {
+          setUploadError(null);
+          setUploadOpen(false);
+        }}
         onChangeMode={setUploadMode}
         onChangeFiles={setUploadFiles}
         onChangeToRoot={setUploadToRoot}

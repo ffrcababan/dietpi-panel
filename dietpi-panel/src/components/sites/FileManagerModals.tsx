@@ -145,8 +145,12 @@ export function NewFileModal({
   onCreate: (filename: string) => Promise<void>;
 }) {
   const [name, setName] = useState('');
+  const [errMsg, setErrMsg] = useState<string | null>(null);
   React.useEffect(() => {
-    if (open) setName('');
+    if (open) {
+      setName('');
+      setErrMsg(null);
+    }
   }, [open]);
   const trimmed = name.trim();
   const valid =
@@ -176,10 +180,20 @@ export function NewFileModal({
         onSubmit={async (e) => {
           e.preventDefault();
           if (!valid || busy) return;
-          await onCreate(trimmed);
+          setErrMsg(null);
+          try {
+            await onCreate(trimmed);
+          } catch (err) {
+            setErrMsg(err instanceof Error ? err.message : 'Failed to create file');
+          }
         }}
         className="space-y-4"
       >
+        {errMsg && (
+          <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+            {errMsg}
+          </div>
+        )}
         <div>
           <label className="block text-xs font-medium text-slate-300 mb-1.5">
             Filename
@@ -265,8 +279,12 @@ export function NewFolderModal({
   onCreate: (folderName: string) => Promise<void>;
 }) {
   const [name, setName] = useState('');
+  const [errMsg, setErrMsg] = useState<string | null>(null);
   React.useEffect(() => {
-    if (open) setName('');
+    if (open) {
+      setName('');
+      setErrMsg(null);
+    }
   }, [open]);
   const trimmed = name.trim();
   const valid =
@@ -287,10 +305,20 @@ export function NewFolderModal({
         onSubmit={async (e) => {
           e.preventDefault();
           if (!valid || busy) return;
-          await onCreate(trimmed);
+          setErrMsg(null);
+          try {
+            await onCreate(trimmed);
+          } catch (err) {
+            setErrMsg(err instanceof Error ? err.message : 'Failed to create folder');
+          }
         }}
         className="space-y-4"
       >
+        {errMsg && (
+          <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+            {errMsg}
+          </div>
+        )}
         <div>
           <label className="block text-xs font-medium text-slate-300 mb-1.5">
             Folder Name
@@ -355,6 +383,7 @@ export function UploadWebAppModal({
   uploadAutoBuild,
   uploading,
   uploadProgress,
+  uploadError,
   onClose,
   onChangeMode,
   onChangeFiles,
@@ -376,6 +405,7 @@ export function UploadWebAppModal({
   uploadAutoBuild: boolean;
   uploading: boolean;
   uploadProgress: { percent: number; label: string } | null;
+  uploadError?: string | null;
   onClose: () => void;
   onChangeMode: (mode: 'files' | 'folder') => void;
   onChangeFiles: (files: File[]) => void;
@@ -412,6 +442,11 @@ export function UploadWebAppModal({
         onSubmit={(e) => void onSubmit(e, uploadPlan)}
         className="space-y-4"
       >
+        {uploadError && (
+          <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+            {uploadError}
+          </div>
+        )}
         {/* Destination selector */}
         <div className="space-y-1.5">
           <div className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
@@ -513,7 +548,11 @@ export function UploadWebAppModal({
               type="file"
               multiple
               disabled={uploading}
-              onChange={(e) => onChangeFiles(Array.from(e.target.files || []))}
+              onChange={(e) => {
+                const picked = Array.from(e.target.files || []);
+                if (picked.length > 0) onChangeFiles(picked);
+                e.currentTarget.value = '';
+              }}
               className="sr-only"
             />
           ) : (
@@ -525,7 +564,11 @@ export function UploadWebAppModal({
                 webkitdirectory: '',
                 directory: '',
               } as Record<string, string>)}
-              onChange={(e) => onChangeFiles(Array.from(e.target.files || []))}
+              onChange={(e) => {
+                const picked = Array.from(e.target.files || []);
+                if (picked.length > 0) onChangeFiles(picked);
+                e.currentTarget.value = '';
+              }}
               className="sr-only"
             />
           )}
@@ -736,11 +779,13 @@ export function PermissionsModal({
 }) {
   const [mode, setMode] = useState(target?.mode || '0644');
   const [recursive, setRecursive] = useState(false);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
 
   React.useEffect(() => {
     if (target) {
       setMode(target.mode || (target.type === 'dir' ? '0755' : '0644'));
       setRecursive(false);
+      setErrMsg(null);
     }
   }, [target]);
 
@@ -756,10 +801,23 @@ export function PermissionsModal({
         <form
           onSubmit={async (e) => {
             e.preventDefault();
-            if (!busy) await onSubmit(mode.trim(), recursive);
+            if (busy) return;
+            setErrMsg(null);
+            try {
+              await onSubmit(mode.trim(), recursive);
+            } catch (err) {
+              setErrMsg(
+                err instanceof Error ? err.message : 'Failed to update permissions'
+              );
+            }
           }}
           className="space-y-4"
         >
+          {errMsg && (
+            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+              {errMsg}
+            </div>
+          )}
           <div className="flex items-center justify-between gap-2 rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-xs text-slate-200">
             <span className="truncate">/{target.path}</span>
             <span className="shrink-0 text-slate-400">{target.type}</span>
@@ -854,9 +912,13 @@ export function RenameModal({
 }) {
   const [value, setValue] = useState(target?.path || '');
   const [busy, setBusy] = useState(false);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
 
   React.useEffect(() => {
-    if (target) setValue(target.path);
+    if (target) {
+      setValue(target.path);
+      setErrMsg(null);
+    }
   }, [target]);
 
   return (
@@ -872,14 +934,22 @@ export function RenameModal({
             e.preventDefault();
             if (!value.trim() || busy) return;
             setBusy(true);
+            setErrMsg(null);
             try {
               await onRename(value.trim());
+            } catch (err) {
+              setErrMsg(err instanceof Error ? err.message : 'Rename failed');
             } finally {
               setBusy(false);
             }
           }}
           className="space-y-4"
         >
+          {errMsg && (
+            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+              {errMsg}
+            </div>
+          )}
           <div>
             <label className="block text-xs font-medium text-slate-300 mb-1">
               Target Relative Path
@@ -927,6 +997,11 @@ export function DeletePathModal({
   onDelete: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (target) setErrMsg(null);
+  }, [target]);
 
   return (
     <Modal
@@ -938,6 +1013,11 @@ export function DeletePathModal({
     >
       {target && (
         <div className="space-y-4">
+          {errMsg && (
+            <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3.5 py-2 text-xs text-rose-200">
+              {errMsg}
+            </div>
+          )}
           <p className="text-xs text-slate-300 leading-relaxed">
             Permanently delete{' '}
             <span className="font-mono font-semibold text-rose-300">
@@ -959,8 +1039,11 @@ export function DeletePathModal({
               disabled={busy}
               onClick={async () => {
                 setBusy(true);
+                setErrMsg(null);
                 try {
                   await onDelete();
+                } catch (err) {
+                  setErrMsg(err instanceof Error ? err.message : 'Delete failed');
                 } finally {
                   setBusy(false);
                 }

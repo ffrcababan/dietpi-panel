@@ -11,7 +11,7 @@ import {
   type ProvisionedDatabaseInfo,
 } from '@/components/RevealKeyModal';
 import { StatusBadge } from '@/components/StatusBadge';
-import { apiFetcher, apiMutate } from '@/lib/client-api';
+import { apiFetcher, apiMutate, apiMutateWithStatus } from '@/lib/client-api';
 import type { TunnelActionResult } from '@/lib/agent';
 import { formatTunnelSummary } from '@/lib/format';
 import {
@@ -206,30 +206,21 @@ export default function SitesPage() {
     setCertRunning(true);
     setCertResult(null);
     try {
-      const res = await fetch('/api/cert', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-panel-csrf': me.csrfToken,
-        },
-        body: JSON.stringify({
-          domain: certDomain.trim().toLowerCase(),
-          dryRun: certDryRun,
-        }),
-      });
-      const json = (await res.json().catch(() => ({}))) as {
+      const { ok, data: json } = await apiMutateWithStatus<{
         ok?: boolean;
         stdout?: string;
         stderr?: string;
         error?: string;
-      };
+      }>('/api/cert', 'POST', me.csrfToken, {
+        domain: certDomain.trim().toLowerCase(),
+        dryRun: certDryRun,
+      });
       setCertResult({
-        ok: res.ok && Boolean(json.ok),
+        ok: ok && Boolean(json.ok),
         stdout: json.stdout || '',
         stderr: json.stderr || json.error || '',
       });
-      if (res.ok && json.ok && !certDryRun) {
+      if (ok && json.ok && !certDryRun) {
         await mutate();
       }
     } catch (err) {

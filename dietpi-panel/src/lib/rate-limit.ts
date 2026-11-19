@@ -17,17 +17,25 @@ function pruneExpired(now: number): void {
   }
 }
 
+const LOOPBACK_IPS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
 export function getClientIp(request: Request): string {
   const xff = request.headers.get('x-forwarded-for');
   if (xff) {
-    // Apache mod_proxy appends the actual client peer IP on the right
+    // Apache mod_proxy / local cloudflared append hops on the right; strip trailing loopback hops
     const parts = xff
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
-    if (parts.length > 0) {
-      return parts[parts.length - 1];
+    for (let i = parts.length - 1; i >= 0; i -= 1) {
+      if (!LOOPBACK_IPS.has(parts[i])) {
+        return parts[i];
+      }
     }
+  }
+  const cfIp = request.headers.get('cf-connecting-ip');
+  if (cfIp) {
+    return cfIp.trim();
   }
   const realIp = request.headers.get('x-real-ip');
   if (realIp) {

@@ -90,7 +90,7 @@ export async function callControlAgent(
     action === 'files.uploadFinish' ||
     action === 'site.git' ||
     action === 'site.build'
-      ? 305_000
+      ? 420_000
       : action === 'cert' ||
           action === 'tunnel.route' ||
           action === 'site.create' ||

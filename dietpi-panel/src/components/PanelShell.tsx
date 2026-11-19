@@ -57,7 +57,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
     Icon: React.ComponentType<{ className?: string }>
   ) => {
     const active = href === '/' ? pathname === '/' : pathname.startsWith(href);
-    const disabled = mustChange && href !== '/account' && href !== '/settings';
+    const disabled = mustChange && href !== '/account';
 
     return (
       <Link

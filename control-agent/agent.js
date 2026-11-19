@@ -129,10 +129,13 @@ function sanitizeParamsForLog(action, params) {
       lower.includes('secret') ||
       lower.includes('key') ||
       lower.includes('password') ||
+      lower.includes('token') ||
       k === 'content' ||
       k === 'contentBase64'
     ) {
       copy[k] = typeof v === 'string' ? `[REDACTED:${v.length}b]` : '[REDACTED]';
+    } else if (k === 'repoUrl' && typeof v === 'string') {
+      copy[k] = stripGitUrlCredentials(v).slice(0, 200);
     } else if (typeof v === 'string' && v.length > 200) {
       copy[k] = `${v.slice(0, 200)}...`;
     } else {
@@ -724,6 +727,143 @@ const UPLOAD_ID_RE = /^[a-f0-9]{32}$/;
 const GIT_URL_RE = /^(?:https:\/\/[a-zA-Z0-9._~:/?#@!$&'()*+,;=%-]+|git@[a-zA-Z0-9.-]+:[a-zA-Z0-9._/-]+)$/;
 const GIT_BRANCH_RE = /^[a-zA-Z0-9._/-]{1,64}$/;
 const SAFE_FILENAME_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+const GIT_TOKENS_DIR = '/etc/control-agent/git-tokens';
+
+function stripGitUrlCredentials(rawUrl) {
+  if (typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (!/^https?:\/\//i.test(trimmed)) return trimmed;
+  try {
+    const u = new URL(trimmed);
+    if (!u.username && !u.password) return trimmed;
+    u.username = '';
+    u.password = '';
+    return u.toString();
+  } catch {
+    return trimmed.replace(/^(https?:\/\/)[^/@\s]+@/i, '$1[REDACTED]@');
+  }
+}
+
+function extractGitUrlAndCredentials(rawUrl, explicitUser = '', explicitToken = '') {
+  const trimmed = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  let cleanUrl = trimmed;
+  let embeddedUser = '';
+  let embeddedToken = '';
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    const u = new URL(trimmed);
+    if (u.password) {
+      embeddedUser = decodeURIComponent(u.username || '');
+      embeddedToken = decodeURIComponent(u.password);
+    } else if (u.username) {
+      embeddedUser = 'x-access-token';
+      embeddedToken = decodeURIComponent(u.username);
+    }
+    u.username = '';
+    u.password = '';
+    cleanUrl = u.toString();
+  }
+
+  const cleanExplicitUser =
+    typeof explicitUser === 'string' ? explicitUser.replace(/[\r\n\0:]/g, '').trim() : '';
+  const cleanExplicitToken =
+    typeof explicitToken === 'string' ? explicitToken.replace(/[\r\n\0]/g, '').trim() : '';
+
+  const token = cleanExplicitToken || embeddedToken;
+  const username = cleanExplicitUser || embeddedUser || (token ? 'x-access-token' : '');
+
+  return {
+    cleanUrl,
+    username,
+    token,
+    explicitUser: cleanExplicitUser,
+    embeddedUser,
+  };
+}
+
+function getSiteGitTokenPath(siteName) {
+  validateName(siteName, 'site name');
+  return path.join(GIT_TOKENS_DIR, `${siteName}.json`);
+}
+
+function readSiteGitToken(siteName) {
+  try {
+    const p = getSiteGitTokenPath(siteName);
+    if (!fs.existsSync(p)) return null;
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!data || typeof data.token !== 'string' || !data.token) return null;
+    return {
+      username: typeof data.username === 'string' && data.username ? data.username : 'x-access-token',
+      token: data.token,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveSiteGitToken(siteName, username, token) {
+  if (!token) return;
+  if (!fs.existsSync(GIT_TOKENS_DIR)) {
+    fs.mkdirSync(GIT_TOKENS_DIR, { recursive: true, mode: 0o700 });
+  }
+  try {
+    fs.chmodSync(GIT_TOKENS_DIR, 0o700);
+  } catch {
+    // ignore
+  }
+  const p = getSiteGitTokenPath(siteName);
+  fs.writeFileSync(
+    p,
+    JSON.stringify({
+      username: username || 'x-access-token',
+      token,
+      updatedAt: new Date().toISOString(),
+    }),
+    { mode: 0o600 }
+  );
+  try {
+    fs.chmodSync(p, 0o600);
+  } catch {
+    // ignore
+  }
+}
+
+function deleteSiteGitToken(siteName) {
+  try {
+    const p = getSiteGitTokenPath(siteName);
+    if (fs.existsSync(p)) fs.rmSync(p, { force: true });
+  } catch {
+    // ignore
+  }
+}
+
+function buildGitAuthEnv(repoUrl, username, token) {
+  const env = {
+    GCM_INTERACTIVE: 'never',
+  };
+  if (!token || !/^https?:\/\//i.test(repoUrl)) {
+    return env;
+  }
+  const u = new URL(repoUrl);
+  const originPrefix = `${u.protocol}//${u.host}/`;
+  const authUser = username || 'x-access-token';
+  const basicB64 = Buffer.from(`${authUser}:${token}`, 'utf8').toString('base64');
+  env.GIT_CONFIG_COUNT = '1';
+  env.GIT_CONFIG_KEY_0 = `http.${originPrefix}.extraHeader`;
+  env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basicB64}`;
+  return env;
+}
+
+function redactSecretText(text, secrets = []) {
+  let out = String(text || '');
+  for (const s of secrets) {
+    if (typeof s === 'string' && s.length >= 4) {
+      out = out.split(s).join('[REDACTED]');
+    }
+  }
+  out = out.replace(/(https?:\/\/)[^/@\s]+@/gi, '$1[REDACTED]@');
+  return out;
+}
 
 function pruneStaleUploads() {
   if (!fs.existsSync(UPLOAD_TMP_DIR)) return;
@@ -870,12 +1010,40 @@ function isExecutableSiteFile(absPath, relPosix, currentMode = 0) {
     if (relPosix.includes('/bin/') || relPosix.startsWith('scripts/')) {
       return (currentMode & 0o111) !== 0 || hasShebangOrElf(absPath);
     }
-    if ((currentMode & 0o111) !== 0 && !base.endsWith('.js') && !base.endsWith('.mjs') && !base.endsWith('.cjs') && !base.endsWith('.py')) {
+    if ((currentMode & 0o111) !== 0) {
       return hasShebangOrElf(absPath);
     }
   }
 
   return false;
+}
+
+function collectBinSymlinkTargets(siteRoot) {
+  const targets = new Set();
+  for (const binRelDir of ['node_modules/.bin', 'vendor/bin', '.venv/bin', 'venv/bin']) {
+    const absBinDir = path.join(siteRoot, binRelDir);
+    try {
+      const dirLst = fs.lstatSync(absBinDir);
+      if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) continue;
+      for (const entry of fs.readdirSync(absBinDir, { withFileTypes: true })) {
+        const linkPath = path.join(absBinDir, entry.name);
+        try {
+          const lst = fs.lstatSync(linkPath);
+          if (!lst.isSymbolicLink()) continue;
+          const resolved = fs.realpathSync(linkPath);
+          if (resolved.startsWith(`${siteRoot}${path.sep}`)) {
+            const relTarget = path.relative(siteRoot, resolved).split(path.sep).join('/');
+            targets.add(relTarget);
+          }
+        } catch {
+          // ignore broken symlinks
+        }
+      }
+    } catch {
+      // ignore missing bin dir
+    }
+  }
+  return targets;
 }
 
 function getEffectiveSiteType(siteRoot, siteType) {
@@ -971,6 +1139,7 @@ function applySitePermissions(siteRoot, siteType = '', opts = {}) {
     }
   }
 
+  const binLinkTargets = collectBinSymlinkTargets(siteRoot);
   const writableDirsFound = new Set();
   const stack = [{ absDir: siteRoot, relDir: '' }];
 
@@ -1022,7 +1191,10 @@ function applySitePermissions(siteRoot, siteType = '', opts = {}) {
         let desiredFileMode;
         if (isEnvSecretFile(relPosix)) {
           desiredFileMode = 0o640;
-        } else if (isExecutableSiteFile(abs, relPosix, lst.mode)) {
+        } else if (
+          binLinkTargets.has(relPosix) ||
+          isExecutableSiteFile(abs, relPosix, lst.mode)
+        ) {
           desiredFileMode = 0o755;
         } else if (isGroupWritableRelDir(relDir, effectiveType, hasDatabaseSqlite)) {
           desiredFileMode = 0o664;
@@ -1135,6 +1307,10 @@ async function installUploadedFile({
             continue;
           }
           const relDest = path.relative(siteRoot, d).split(path.sep).join('/');
+          const existingDest = lstatNoFollow(d);
+          if (existingDest && existingDest.isSymbolicLink()) {
+            throw new Error(`Refusing to overwrite symbolic link: ${relDest}`);
+          }
           const effectiveType = getEffectiveSiteType(siteRoot, siteType);
           if (lst.isDirectory()) {
             const dMode = isGroupWritableRelDir(relDest, effectiveType, false) ? 0o775 : 0o755;
@@ -1265,8 +1441,22 @@ function chownRecursiveSafe(targetPath, uid, gid) {
   }
 }
 
+function lstatNoFollow(targetPath) {
+  try {
+    return fs.lstatSync(targetPath);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
 function resolveJailedPath(name, rawRelPath = '', opts = {}) {
-  const { allowRoot = false, allowMissingLeaf = false, protectDbPhp = true } = opts;
+  const {
+    allowRoot = false,
+    allowMissingLeaf = false,
+    protectDbPhp = true,
+    allowSymlinkLeaf = false,
+  } = opts;
   const siteName = validateName(name, 'site name');
   const baseDir = `/var/www/${siteName}`;
   if (!fs.existsSync(baseDir)) {
@@ -1311,7 +1501,29 @@ function resolveJailedPath(name, rawRelPath = '', opts = {}) {
     }
   };
 
-  if (fs.existsSync(candidate)) {
+  const leafLst = lstatNoFollow(candidate);
+  if (leafLst) {
+    if (leafLst.isSymbolicLink()) {
+      if (allowSymlinkLeaf) {
+        const resolvedParent = fs.realpathSync(path.dirname(candidate));
+        ensureInside(resolvedParent);
+        return {
+          siteRoot,
+          targetPath: path.join(resolvedParent, path.basename(candidate)),
+          relPath,
+        };
+      }
+      if (!fs.existsSync(candidate)) {
+        throw new Error('Target is a broken symbolic link');
+      }
+      const resolvedLinkTarget = fs.realpathSync(candidate);
+      ensureInside(resolvedLinkTarget);
+      if (allowMissingLeaf) {
+        throw new Error('Refusing to overwrite symbolic link');
+      }
+      return { siteRoot, targetPath: resolvedLinkTarget, relPath };
+    }
+
     const resolved = fs.realpathSync(candidate);
     ensureInside(resolved);
     return { siteRoot, targetPath: resolved, relPath };
@@ -1321,12 +1533,16 @@ function resolveJailedPath(name, rawRelPath = '', opts = {}) {
     throw new Error(`Path not found: ${relPath}`);
   }
 
-  // Walk upward to the deepest existing parent to verify no symlink escapes the jail
+  // Walk upward to the deepest existing parent (not following missing paths) to verify no symlink escapes the jail
   let cursor = path.dirname(candidate);
-  while (!fs.existsSync(cursor)) {
+  while (!lstatNoFollow(cursor)) {
     const next = path.dirname(cursor);
     if (next === cursor) break;
     cursor = next;
+  }
+  const cursorLst = lstatNoFollow(cursor);
+  if (cursorLst && cursorLst.isSymbolicLink() && !fs.existsSync(cursor)) {
+    throw new Error('Parent path contains a broken symbolic link');
   }
   const resolvedAncestor = fs.realpathSync(cursor);
   ensureInside(resolvedAncestor);
@@ -1568,8 +1784,8 @@ async function executeSiteBuildOnce(name, trigger = 'manual') {
     const scripts = readPackageScripts(siteRoot);
     if (allOk && scripts && typeof scripts.build === 'string') {
       const installCmd = fs.existsSync(path.join(siteRoot, 'package-lock.json')) ? 'ci' : 'install';
-      if (await runStep(npmBin, [installCmd])) {
-        await runStep(npmBin, ['run', 'build']);
+      if (await runStep(npmBin, [installCmd], { NODE_ENV: 'development' })) {
+        await runStep(npmBin, ['run', 'build'], { NODE_ENV: 'production' });
       }
     }
     if (allOk && fs.existsSync(path.join(siteRoot, 'artisan'))) {
@@ -1591,9 +1807,9 @@ async function executeSiteBuildOnce(name, trigger = 'manual') {
       });
     } else {
       const installCmd = fs.existsSync(path.join(siteRoot, 'package-lock.json')) ? 'ci' : 'install';
-      if (await runStep(npmBin, [installCmd])) {
+      if (await runStep(npmBin, [installCmd], { NODE_ENV: 'development' })) {
         if (typeof scripts.build === 'string') {
-          await runStep(npmBin, ['run', 'build']);
+          await runStep(npmBin, ['run', 'build'], { NODE_ENV: 'production' });
         }
       }
     }
@@ -2044,6 +2260,7 @@ async function handleAction(action, params = {}, socket = null) {
       }
 
       disableSiteWatcher(name, true);
+      deleteSiteGitToken(name);
 
       const siteDomain = readVhostServerName(vhostPath);
       const archiveBase = '/srv/backups/sites';
@@ -2253,7 +2470,7 @@ async function handleAction(action, params = {}, socket = null) {
         }
       }
 
-      const activeSitesCount = sites.filter((s) => !s.isPanel).length;
+      const activeSitesCount = sites.filter((s) => !s.isPanel && s.type !== 'dbonly').length;
       const stats = {
         dbCount: databases.length,
         siteCount: activeSitesCount,
@@ -2477,21 +2694,22 @@ async function handleAction(action, params = {}, socket = null) {
     }
 
     case 'files.uploadStart': {
-      validateName(params.name, 'site name');
+      const name = validateName(params.name, 'site name');
       pruneStaleUploads();
       fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true, mode: 0o700 });
       const uploadId = crypto.randomBytes(16).toString('hex');
-      const partPath = path.join(UPLOAD_TMP_DIR, `${uploadId}.part`);
+      const partPath = path.join(UPLOAD_TMP_DIR, `${name}.${uploadId}.part`);
       fs.writeFileSync(partPath, Buffer.alloc(0), { mode: 0o600 });
       return { ok: true, stdout: JSON.stringify({ uploadId }), stderr: '' };
     }
 
     case 'files.uploadChunk': {
+      const name = validateName(params.name, 'site name');
       const uploadId = typeof params.uploadId === 'string' ? params.uploadId.trim() : '';
       if (!UPLOAD_ID_RE.test(uploadId)) {
         throw new Error('Invalid uploadId');
       }
-      const partPath = path.join(UPLOAD_TMP_DIR, `${uploadId}.part`);
+      const partPath = path.join(UPLOAD_TMP_DIR, `${name}.${uploadId}.part`);
       if (!fs.existsSync(partPath)) {
         throw new Error('Upload session expired or not found');
       }
@@ -2521,7 +2739,7 @@ async function handleAction(action, params = {}, socket = null) {
       if (!UPLOAD_ID_RE.test(uploadId)) {
         throw new Error('Invalid uploadId');
       }
-      const partPath = path.join(UPLOAD_TMP_DIR, `${uploadId}.part`);
+      const partPath = path.join(UPLOAD_TMP_DIR, `${name}.${uploadId}.part`);
       if (!fs.existsSync(partPath)) {
         throw new Error('Upload session expired or not found');
       }
@@ -2655,6 +2873,7 @@ async function handleAction(action, params = {}, socket = null) {
       const { targetPath, relPath } = resolveJailedPath(name, params.path, {
         allowRoot: false,
         protectDbPhp: true,
+        allowSymlinkLeaf: true,
       });
       fs.rmSync(targetPath, { recursive: true, force: true });
       return { ok: true, stdout: JSON.stringify({ deleted: relPath }), stderr: '' };
@@ -2672,10 +2891,18 @@ async function handleAction(action, params = {}, socket = null) {
       const hasGit = fs.existsSync(path.join(siteRoot, '.git'));
 
       if (gitAction === 'status') {
+        const savedCred = readSiteGitToken(name);
         if (!hasGit) {
           return {
             ok: true,
-            stdout: JSON.stringify({ initialized: false, remote: '', branch: '', status: '' }),
+            stdout: JSON.stringify({
+              initialized: false,
+              remote: '',
+              branch: '',
+              status: '',
+              hasSavedToken: Boolean(savedCred),
+              savedUsername: savedCred?.username || '',
+            }),
             stderr: '',
           };
         }
@@ -2684,14 +2911,26 @@ async function handleAction(action, params = {}, socket = null) {
           runAsWwwData(gitBin, ['-C', siteRoot, 'rev-parse', '--abbrev-ref', 'HEAD'], siteRoot, 15_000),
           runAsWwwData(gitBin, ['-C', siteRoot, 'status', '--short'], siteRoot, 15_000),
         ]);
+        const cleanRemote = remRes.ok ? stripGitUrlCredentials(remRes.stdout.trim()) : '';
         return {
           ok: true,
           stdout: JSON.stringify({
             initialized: true,
-            remote: remRes.ok ? remRes.stdout.trim() : '',
+            remote: cleanRemote,
             branch: brRes.ok ? brRes.stdout.trim() : '',
             status: stRes.stdout.trim(),
+            hasSavedToken: Boolean(savedCred),
+            savedUsername: savedCred?.username || '',
           }),
+          stderr: '',
+        };
+      }
+
+      if (gitAction === 'clearToken') {
+        deleteSiteGitToken(name);
+        return {
+          ok: true,
+          stdout: JSON.stringify({ cleared: true }),
           stderr: '',
         };
       }
@@ -2706,25 +2945,48 @@ async function handleAction(action, params = {}, socket = null) {
       const triggerBuild = params.triggerBuild !== false;
 
       if (gitAction === 'clone') {
-        const repoUrl = typeof params.repoUrl === 'string' ? params.repoUrl.trim() : '';
-        if (!repoUrl || repoUrl.startsWith('-') || !GIT_URL_RE.test(repoUrl)) {
+        const rawRepoUrl = typeof params.repoUrl === 'string' ? params.repoUrl.trim() : '';
+        if (!rawRepoUrl || rawRepoUrl.startsWith('-') || !GIT_URL_RE.test(rawRepoUrl)) {
           throw new Error('Invalid repository URL (use https://... or git@...)');
         }
         if (hasGit) {
           throw new Error('Repository already initialized; use git pull instead');
         }
 
+        const explicitUser = typeof params.username === 'string' ? params.username : '';
+        const explicitToken = typeof params.token === 'string' ? params.token : '';
+        const { cleanUrl, username: authUser, token: authToken } =
+          extractGitUrlAndCredentials(rawRepoUrl, explicitUser, explicitToken);
+
+        if (authToken && !/^https:\/\//i.test(cleanUrl)) {
+          throw new Error('Personal access tokens require an https:// repository URL');
+        }
+
         const stageDir = fs.mkdtempSync('/tmp/dp-clone-');
         const { uid, gid } = getWwwDataIds();
         chownPathNoFollow(stageDir, uid, gid);
         try {
-          const cloneArgs = ['clone', '--depth', '1'];
+          const cloneArgs = ['-c', 'credential.helper=', 'clone', '--depth', '1'];
           if (branch) cloneArgs.push('--branch', branch);
-          cloneArgs.push('--', repoUrl, path.join(stageDir, 'repo'));
+          cloneArgs.push('--', cleanUrl, path.join(stageDir, 'repo'));
 
-          const cloneStep = await runAsWwwData(gitBin, cloneArgs, stageDir, BUILD_TIMEOUT_MS);
+          const authEnv = buildGitAuthEnv(cleanUrl, authUser, authToken);
+          const cloneStep = await runAsWwwData(
+            gitBin,
+            cloneArgs,
+            stageDir,
+            BUILD_TIMEOUT_MS,
+            authEnv
+          );
           if (!cloneStep.ok) {
-            return { ok: false, stdout: '', stderr: cloneStep.stderr || 'git clone failed' };
+            return {
+              ok: false,
+              stdout: '',
+              stderr: redactSecretText(
+                cloneStep.stderr || 'git clone failed',
+                [authToken]
+              ),
+            };
           }
 
           // Merge cloned repository into siteRoot while preserving .env* and db.php symlink
@@ -2747,10 +3009,20 @@ async function handleAction(action, params = {}, socket = null) {
           fs.rmSync(stageDir, { recursive: true, force: true });
         }
 
+        if (authToken && params.saveToken === true) {
+          saveSiteGitToken(name, authUser, authToken);
+        }
+
         const build = triggerBuild ? await runSiteBuild(name, 'git-clone') : null;
         return {
           ok: true,
-          stdout: JSON.stringify({ cloned: true, repoUrl, branch: branch || 'default', build }),
+          stdout: JSON.stringify({
+            cloned: true,
+            repoUrl: cleanUrl,
+            branch: branch || 'default',
+            hasSavedToken: Boolean(readSiteGitToken(name)),
+            build,
+          }),
           stderr: '',
         };
       }
@@ -2759,19 +3031,79 @@ async function handleAction(action, params = {}, socket = null) {
         if (!hasGit) {
           throw new Error('No git repository found in this site; clone a repository first');
         }
-        const pullArgs = ['-C', siteRoot, 'pull', '--ff-only'];
-        if (branch) pullArgs.push('origin', branch);
-        const pullStep = await runAsWwwData(gitBin, pullArgs, siteRoot, BUILD_TIMEOUT_MS);
-        if (!pullStep.ok) {
-          return { ok: false, stdout: pullStep.stdout, stderr: pullStep.stderr || 'git pull failed' };
+
+        const remRes = await runAsWwwData(
+          gitBin,
+          ['-C', siteRoot, 'remote', 'get-url', 'origin'],
+          siteRoot,
+          15_000
+        );
+        const rawOrigin = remRes.ok ? remRes.stdout.trim() : '';
+        const explicitUser = typeof params.username === 'string' ? params.username : '';
+        const explicitToken = typeof params.token === 'string' ? params.token : '';
+        const parsedOrigin = extractGitUrlAndCredentials(
+          rawOrigin,
+          explicitUser,
+          explicitToken
+        );
+
+        // If an older clone embedded credentials in .git/config, scrub .git/config cleanly
+        if (rawOrigin && parsedOrigin.cleanUrl && rawOrigin !== parsedOrigin.cleanUrl) {
+          await runAsWwwData(
+            gitBin,
+            ['-C', siteRoot, 'remote', 'set-url', 'origin', parsedOrigin.cleanUrl],
+            siteRoot,
+            10_000
+          );
         }
+
+        const saved = readSiteGitToken(name);
+        const targetRemote = parsedOrigin.cleanUrl || rawOrigin;
+        if (explicitToken.trim() && targetRemote && !/^https:\/\//i.test(targetRemote)) {
+          throw new Error('Personal access tokens require an https:// repository remote');
+        }
+        const authUser =
+          parsedOrigin.explicitUser ||
+          parsedOrigin.embeddedUser ||
+          saved?.username ||
+          'x-access-token';
+        const authToken = parsedOrigin.token || saved?.token || '';
+
+        const pullArgs = ['-c', 'credential.helper=', '-C', siteRoot, 'pull', '--ff-only'];
+        if (branch) pullArgs.push('origin', branch);
+
+        const authEnv = buildGitAuthEnv(targetRemote, authUser, authToken);
+        const pullStep = await runAsWwwData(
+          gitBin,
+          pullArgs,
+          siteRoot,
+          BUILD_TIMEOUT_MS,
+          authEnv
+        );
+        if (!pullStep.ok) {
+          return {
+            ok: false,
+            stdout: redactSecretText(pullStep.stdout, [authToken]),
+            stderr: redactSecretText(pullStep.stderr || 'git pull failed', [authToken]),
+          };
+        }
+
+        if (parsedOrigin.token && params.saveToken === true) {
+          saveSiteGitToken(name, authUser, parsedOrigin.token);
+        }
+
         applySitePermissions(siteRoot, getSiteTypeFromVhost(name), {
           ensureFrameworkDirs: true,
         });
         const build = triggerBuild ? await runSiteBuild(name, 'git-pull') : null;
         return {
           ok: true,
-          stdout: JSON.stringify({ pulled: true, output: pullStep.stdout.trim(), build }),
+          stdout: JSON.stringify({
+            pulled: true,
+            output: redactSecretText(pullStep.stdout.trim(), [authToken]),
+            hasSavedToken: Boolean(readSiteGitToken(name)),
+            build,
+          }),
           stderr: '',
         };
       }
@@ -2861,7 +3193,7 @@ function createServer() {
     let buffer = '';
     let handled = false;
     socket.setEncoding('utf8');
-    socket.setTimeout(BUILD_TIMEOUT_MS + 10_000);
+    socket.setTimeout(BUILD_TIMEOUT_MS + 130_000);
 
     const writeResponse = (resp) => {
       if (!socket.destroyed) {

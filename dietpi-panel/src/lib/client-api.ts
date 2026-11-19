@@ -32,8 +32,7 @@ export async function apiFetcher<T>(url: string): Promise<T> {
       res.status === 403 &&
       data.code === 'PASSWORD_CHANGE_REQUIRED' &&
       typeof window !== 'undefined' &&
-      window.location.pathname !== '/account' &&
-      window.location.pathname !== '/settings'
+      window.location.pathname !== '/account'
     ) {
       window.location.href = '/account';
     }
@@ -47,12 +46,12 @@ export async function apiFetcher<T>(url: string): Promise<T> {
   return data as T;
 }
 
-export async function apiMutate<T>(
+async function fetchMutateWithCsrfRetry(
   url: string,
   method: 'POST' | 'DELETE' | 'PUT' | 'PATCH',
   csrfToken: string,
   body?: unknown
-): Promise<T> {
+): Promise<Response> {
   const doFetch = (token: string) =>
     fetch(url, {
       method,
@@ -93,6 +92,31 @@ export async function apiMutate<T>(
     }
     throw new ApiError('Session expired. Please sign in again.', 401);
   }
+
+  return res;
+}
+
+export async function apiMutateWithStatus<T>(
+  url: string,
+  method: 'POST' | 'DELETE' | 'PUT' | 'PATCH',
+  csrfToken: string,
+  body?: unknown
+): Promise<{ ok: boolean; status: number; data: T & { error?: string; code?: string } }> {
+  const res = await fetchMutateWithCsrfRetry(url, method, csrfToken, body);
+  const data = (await res.json().catch(() => ({}))) as T & {
+    error?: string;
+    code?: string;
+  };
+  return { ok: res.ok, status: res.status, data };
+}
+
+export async function apiMutate<T>(
+  url: string,
+  method: 'POST' | 'DELETE' | 'PUT' | 'PATCH',
+  csrfToken: string,
+  body?: unknown
+): Promise<T> {
+  const res = await fetchMutateWithCsrfRetry(url, method, csrfToken, body);
 
   const data = (await res.json().catch(() => ({}))) as {
     error?: string;

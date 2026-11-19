@@ -46,10 +46,18 @@ export default function SiteWorkspacePage({
   const [newDirOpen, setNewDirOpen] = useState(false);
   const [newDirName, setNewDirName] = useState('');
   const [uploadOpen, setUploadOpen] = useState(false);
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadMode, setUploadMode] = useState<'files' | 'folder'>('files');
+  const [uploadFiles, setUploadFiles] = useState<File[]>([]);
+  const [uploadToRoot, setUploadToRoot] = useState(true);
+  const [stripTopFolder, setStripTopFolder] = useState(true);
   const [extractZip, setExtractZip] = useState(true);
   const [uploadAutoBuild, setUploadAutoBuild] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{
+    percent: number;
+    label: string;
+  } | null>(null);
 
   const [renameTarget, setRenameTarget] = useState<FileEntry | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -195,62 +203,292 @@ export default function SiteWorkspacePage({
     }
   };
 
+  const openUploadModal = (toRoot: boolean) => {
+    setUploadToRoot(toRoot);
+    setUploadMode('files');
+    setUploadFiles([]);
+    setUploadProgress(null);
+    setDragActive(false);
+    setUploadOpen(true);
+  };
+
+  const MAX_WEBAPP_UPLOAD_BYTES = 100 * 1024 * 1024;
+  const CHUNK_THRESHOLD_BYTES = Math.floor(1.5 * 1024 * 1024);
+  const CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
+  const SAFE_UPLOAD_SEG_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+  const SKIP_UPLOAD_DIRS = new Set([
+    '.git',
+    'node_modules',
+    '.next',
+    '.nuxt',
+    '.svelte-kit',
+    '.astro',
+    '.venv',
+    '__pycache__',
+  ]);
+  const SKIP_UPLOAD_FILES = new Set(['.DS_Store', 'Thumbs.db']);
+
+  interface QueuedUploadItem {
+    file: File;
+    dir: string;
+    filename: string;
+    targetPath: string;
+  }
+
+  const baseUploadDir = uploadToRoot ? '' : currentDir;
+  const firstRelPath =
+    (uploadFiles[0] as (File & { webkitRelativePath?: string }) | undefined)
+      ?.webkitRelativePath || '';
+  const topFolderName =
+    uploadMode === 'folder' && firstRelPath.includes('/')
+      ? firstRelPath.split('/')[0] || ''
+      : '';
+
+  const uploadPlan = (() => {
+    const validItems: QueuedUploadItem[] = [];
+    const invalidPaths: string[] = [];
+    let skippedFiltered = 0;
+    let skippedDbPhp = 0;
+    let totalBytes = 0;
+
+    for (const file of uploadFiles) {
+      const relRaw =
+        (
+          (file as File & { webkitRelativePath?: string }).webkitRelativePath ||
+          file.name
+        ).replace(/\\/g, '/');
+      let segments = relRaw.split('/').filter(Boolean);
+      if (uploadMode === 'folder' && stripTopFolder && segments.length > 1) {
+        segments = segments.slice(1);
+      }
+      if (segments.length === 0) continue;
+
+      const filename = segments[segments.length - 1];
+      const dirSegments = segments.slice(0, -1);
+
+      if (
+        dirSegments.some((seg) => SKIP_UPLOAD_DIRS.has(seg)) ||
+        SKIP_UPLOAD_FILES.has(filename)
+      ) {
+        skippedFiltered += 1;
+        continue;
+      }
+
+      if (
+        segments.some(
+          (seg) => seg === '.' || seg === '..' || !SAFE_UPLOAD_SEG_RE.test(seg)
+        )
+      ) {
+        invalidPaths.push(segments.join('/'));
+        continue;
+      }
+
+      const combinedDirs = [baseUploadDir, ...dirSegments].filter(Boolean);
+      const dir = combinedDirs.join('/');
+      if (dir.length + 1 + filename.length > 512) {
+        invalidPaths.push(segments.join('/'));
+        continue;
+      }
+
+      if (dir === '' && filename === 'db.php') {
+        skippedDbPhp += 1;
+        continue;
+      }
+
+      const targetPath = dir ? `${dir}/${filename}` : filename;
+      validItems.push({ file, dir, filename, targetPath });
+      totalBytes += file.size;
+    }
+
+    const isSingleZip =
+      validItems.length === 1 &&
+      validItems[0].filename.toLowerCase().endsWith('.zip');
+
+    return {
+      validItems,
+      invalidPaths,
+      skippedFiltered,
+      skippedDbPhp,
+      totalBytes,
+      isSingleZip,
+    };
+  })();
+
+  const uint8ToBase64 = (bytes: Uint8Array): string => {
+    const sliceSize = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += sliceSize) {
+      const sub = bytes.subarray(i, i + sliceSize);
+      binary += String.fromCharCode(...Array.from(sub));
+    }
+    return btoa(binary);
+  };
+
   const handleUpload = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!me?.csrfToken || !uploadFile) return;
-    if (uploadFile.size > 8 * 1024 * 1024) {
-      setBanner({ ok: false, text: 'Max upload size is 8 MB.' });
+    if (!me?.csrfToken || uploadPlan.validItems.length === 0) return;
+
+    if (uploadPlan.invalidPaths.length > 0) {
+      setBanner({
+        ok: false,
+        text: `Unsupported characters in filename/path (e.g. spaces): ${uploadPlan.invalidPaths[0]}. Rename or package inside a clean .zip.`,
+      });
+      return;
+    }
+
+    if (uploadPlan.totalBytes > MAX_WEBAPP_UPLOAD_BYTES) {
+      setBanner({
+        ok: false,
+        text: 'Total upload size exceeds the 100 MB limit.',
+      });
       return;
     }
 
     setUploading(true);
     setBanner(null);
+    const totalBytes = Math.max(1, uploadPlan.totalBytes);
+    let completedBytes = 0;
+
     try {
-      const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const res = String(reader.result || '');
-          const comma = res.indexOf(',');
-          resolve(comma !== -1 ? res.slice(comma + 1) : res);
-        };
-        reader.onerror = () => reject(new Error('Failed to read local file'));
-        reader.readAsDataURL(uploadFile);
-      });
+      const items = uploadPlan.validItems;
+      const singleMode = items.length === 1;
+      let lastExtractedFiles = 0;
+      let finalBuild: SiteBuildRecord | null = null;
 
-      const res = await apiMutate<{
-        result: {
-          path: string;
-          bytes: number;
-          extractedFiles: number;
+      for (let idx = 0; idx < items.length; idx += 1) {
+        const item = items[idx];
+        const shouldExtract = uploadPlan.isSingleZip && extractZip;
+        const inlineBuild = singleMode && uploadAutoBuild;
+        const stepPrefix = singleMode
+          ? item.filename
+          : `[${idx + 1}/${items.length}] ${item.targetPath}`;
+
+        setUploadProgress({
+          percent: Math.min(99, Math.round((completedBytes / totalBytes) * 100)),
+          label: `Uploading ${stepPrefix}...`,
+        });
+
+        if (item.file.size > CHUNK_THRESHOLD_BYTES) {
+          const startRes = await apiMutate<{
+            ok: boolean;
+            result: { uploadId: string };
+          }>(`/api/sites/${encodeURIComponent(siteName)}/upload`, 'POST', me.csrfToken, {
+            op: 'start',
+          });
+          const uploadId = startRes.result.uploadId;
+
+          let offset = 0;
+          while (offset < item.file.size) {
+            const end = Math.min(item.file.size, offset + CHUNK_SIZE_BYTES);
+            const buf = await item.file.slice(offset, end).arrayBuffer();
+            const contentBase64 = uint8ToBase64(new Uint8Array(buf));
+
+            await apiMutate<{
+              ok: boolean;
+              result: { bytesWritten: number };
+            }>(`/api/sites/${encodeURIComponent(siteName)}/upload`, 'POST', me.csrfToken, {
+              op: 'chunk',
+              uploadId,
+              contentBase64,
+            });
+
+            offset = end;
+            setUploadProgress({
+              percent: Math.min(
+                99,
+                Math.round(((completedBytes + offset) / totalBytes) * 100)
+              ),
+              label: `Uploading ${stepPrefix} (${Math.round((offset / (1024 * 1024)) * 10) / 10} / ${Math.round((item.file.size / (1024 * 1024)) * 10) / 10} MB)`,
+            });
+          }
+
+          if (shouldExtract) {
+            setUploadProgress({
+              percent: 99,
+              label: `Extracting ${item.filename}${inlineBuild ? ' and running build' : ''}...`,
+            });
+          }
+
+          const finishRes = await apiMutate<{
+            ok: boolean;
+            result: {
+              path: string;
+              bytes: number;
+              extractedFiles: number;
+              build: SiteBuildRecord | null;
+            };
+          }>(`/api/sites/${encodeURIComponent(siteName)}/upload`, 'POST', me.csrfToken, {
+            op: 'finish',
+            uploadId,
+            dir: item.dir,
+            filename: item.filename,
+            extractZip: shouldExtract,
+            triggerBuild: inlineBuild,
+          });
+          lastExtractedFiles = finishRes.result.extractedFiles;
+          if (finishRes.result.build) finalBuild = finishRes.result.build;
+        } else {
+          const buf = await item.file.arrayBuffer();
+          const contentBase64 = uint8ToBase64(new Uint8Array(buf));
+          const res = await apiMutate<{
+            result: {
+              path: string;
+              bytes: number;
+              extractedFiles: number;
+              build: SiteBuildRecord | null;
+            };
+          }>(`/api/sites/${encodeURIComponent(siteName)}/files`, 'POST', me.csrfToken, {
+            op: 'upload',
+            dir: item.dir,
+            filename: item.filename,
+            contentBase64,
+            extractZip: shouldExtract,
+            triggerBuild: inlineBuild,
+          });
+          lastExtractedFiles = res.result.extractedFiles;
+          if (res.result.build) finalBuild = res.result.build;
+        }
+
+        completedBytes += item.file.size;
+      }
+
+      if (!singleMode && uploadAutoBuild) {
+        setUploadProgress({
+          percent: 99,
+          label: `Running ${siteType} build pipeline...`,
+        });
+        const buildRes = await apiMutate<{
+          ok: boolean;
           build: SiteBuildRecord | null;
-        };
-      }>(`/api/sites/${encodeURIComponent(siteName)}/files`, 'POST', me.csrfToken, {
-        op: 'upload',
-        dir: currentDir,
-        filename: uploadFile.name,
-        contentBase64: base64,
-        extractZip: uploadFile.name.toLowerCase().endsWith('.zip') && extractZip,
-        triggerBuild: uploadAutoBuild,
-      });
+        }>(`/api/sites/${encodeURIComponent(siteName)}/build`, 'POST', me.csrfToken, {});
+        finalBuild = buildRes.build;
+      }
 
+      setUploadProgress({ percent: 100, label: 'Done' });
       setUploadOpen(false);
-      setUploadFile(null);
-      const b = res.result.build;
+      setUploadFiles([]);
+      setUploadProgress(null);
+
+      const summaryText = singleMode
+        ? lastExtractedFiles > 0
+          ? `Extracted ${lastExtractedFiles} file(s)`
+          : `Uploaded ${items[0].targetPath}`
+        : `Uploaded ${items.length} file(s)`;
+
       setBanner({
-        ok: b ? b.ok : true,
-        text:
-          res.result.extractedFiles > 0
-            ? `Extracted ${res.result.extractedFiles} file(s)${b ? ` · build ${b.ok ? 'succeeded' : 'failed'}` : ''}.`
-            : `Uploaded ${res.result.path}${b ? ` · build ${b.ok ? 'succeeded' : 'failed'}` : ''}.`,
+        ok: finalBuild ? finalBuild.ok : true,
+        text: `${summaryText}${finalBuild ? ` · build ${finalBuild.ok ? 'succeeded' : 'failed'}` : ''}.`,
       });
       await Promise.all([mutateFiles(), mutateBuild()]);
     } catch (err) {
+      await Promise.all([mutateFiles(), mutateBuild()]);
       setBanner({
         ok: false,
         text: err instanceof Error ? err.message : 'Upload failed',
       });
     } finally {
       setUploading(false);
+      setUploadProgress(null);
     }
   };
 
@@ -431,6 +669,28 @@ export default function SiteWorkspacePage({
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            onClick={() => openUploadModal(true)}
+            className="inline-flex items-center gap-2 rounded-lg border border-accent/50 bg-accent/15 px-3.5 py-2 text-xs font-semibold text-accent hover:bg-accent/25 transition"
+          >
+            <svg
+              className="w-3.5 h-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <span>Upload Web App</span>
+          </button>
+
+          <button
+            type="button"
             disabled={watchBusy}
             onClick={handleToggleWatch}
             className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition ${
@@ -563,10 +823,7 @@ export default function SiteWorkspacePage({
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setUploadFile(null);
-                    setUploadOpen(true);
-                  }}
+                  onClick={() => openUploadModal(!currentDir)}
                   className="rounded-md bg-accent/15 border border-accent/40 px-2 py-1 text-[11px] font-medium text-accent hover:bg-accent/25"
                 >
                   Upload
@@ -943,36 +1200,242 @@ export default function SiteWorkspacePage({
         </form>
       </Modal>
 
-      {/* Upload File / Zip Modal */}
+      {/* Upload Web App / Files / Folder Modal */}
       <Modal
         open={uploadOpen}
-        title="Upload File or .zip Archive"
-        subtitle="Max 8 MB per upload. Safe extraction skips symlinks and preserves /db.php."
-        onClose={() => setUploadOpen(false)}
+        title="Upload Finished Web App"
+        subtitle="Upload a .zip archive, multiple files, or a built folder up to 100 MB (chunked). Symlinks are skipped and /db.php is protected."
+        onClose={() => {
+          if (!uploading) setUploadOpen(false);
+        }}
       >
         <form onSubmit={handleUpload} className="space-y-4">
-          <input
-            type="file"
-            required
-            onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
-            className="w-full text-xs text-slate-300 file:mr-3 file:rounded-lg file:border-0 file:bg-elevated file:px-3 file:py-2 file:text-xs file:font-medium file:text-slate-200"
-          />
+          {/* Destination selector */}
+          <div className="space-y-1.5">
+            <div className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
+              Destination
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                disabled={uploading}
+                onClick={() => setUploadToRoot(true)}
+                className={`rounded-lg border px-3 py-2 text-left text-xs transition ${
+                  uploadToRoot
+                    ? 'border-accent/60 bg-accent/15 text-slate-100'
+                    : 'border-borderline bg-canvas text-slate-400 hover:border-slate-500'
+                }`}
+              >
+                <div className="font-medium">Site Root</div>
+                <div className="truncate font-mono text-[10px] text-slate-400">
+                  /var/www/{siteName}/
+                </div>
+              </button>
+              <button
+                type="button"
+                disabled={uploading}
+                onClick={() => setUploadToRoot(false)}
+                className={`rounded-lg border px-3 py-2 text-left text-xs transition ${
+                  !uploadToRoot
+                    ? 'border-accent/60 bg-accent/15 text-slate-100'
+                    : 'border-borderline bg-canvas text-slate-400 hover:border-slate-500'
+                }`}
+              >
+                <div className="font-medium">Current Folder</div>
+                <div className="truncate font-mono text-[10px] text-slate-400">
+                  /{currentDir || ''}
+                </div>
+              </button>
+            </div>
+          </div>
 
-          {uploadFile?.name.toLowerCase().endsWith('.zip') && (
+          {/* Mode tabs */}
+          <div className="flex rounded-lg border border-borderline bg-canvas p-1 gap-1">
+            <button
+              type="button"
+              disabled={uploading}
+              onClick={() => {
+                setUploadMode('files');
+                setUploadFiles([]);
+              }}
+              className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                uploadMode === 'files'
+                  ? 'bg-elevated text-slate-100 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              .zip Archive / Files
+            </button>
+            <button
+              type="button"
+              disabled={uploading}
+              onClick={() => {
+                setUploadMode('folder');
+                setUploadFiles([]);
+              }}
+              className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                uploadMode === 'folder'
+                  ? 'bg-elevated text-slate-100 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Project / Dist Folder
+            </button>
+          </div>
+
+          {/* Dropzone / Picker */}
+          <label
+            onDragOver={(e) => {
+              if (uploadMode !== 'files' || uploading) return;
+              e.preventDefault();
+              setDragActive(true);
+            }}
+            onDragLeave={() => setDragActive(false)}
+            onDrop={(e) => {
+              if (uploadMode !== 'files' || uploading) return;
+              e.preventDefault();
+              setDragActive(false);
+              const dropped = Array.from(e.dataTransfer?.files || []);
+              if (dropped.length > 0) setUploadFiles(dropped);
+            }}
+            className={`flex flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed px-4 py-6 text-center transition ${
+              uploading
+                ? 'cursor-not-allowed border-borderline bg-canvas/50 opacity-60'
+                : dragActive
+                  ? 'cursor-pointer border-accent bg-accent/10'
+                  : 'cursor-pointer border-borderline bg-canvas hover:border-slate-500'
+            }`}
+          >
+            {uploadMode === 'files' ? (
+              <input
+                type="file"
+                multiple
+                disabled={uploading}
+                onChange={(e) =>
+                  setUploadFiles(Array.from(e.target.files || []))
+                }
+                className="sr-only"
+              />
+            ) : (
+              <input
+                type="file"
+                multiple
+                disabled={uploading}
+                {...({
+                  webkitdirectory: '',
+                  directory: '',
+                } as Record<string, string>)}
+                onChange={(e) =>
+                  setUploadFiles(Array.from(e.target.files || []))
+                }
+                className="sr-only"
+              />
+            )}
+            <div className="text-xs font-medium text-slate-200">
+              {uploadMode === 'files'
+                ? 'Click to select a .zip archive or files, or drag & drop here'
+                : 'Click to select your built folder (e.g. dist/, build/, out/, or app root)'}
+            </div>
+            <div className="text-[11px] text-slate-400">
+              {uploadMode === 'files'
+                ? 'Files over 1.5 MB stream automatically in 2 MB chunks (up to 100 MB)'
+                : 'Preserves subfolder structure; skips .git, node_modules, and /db.php'}
+            </div>
+          </label>
+
+          {/* Queue summary & validation warnings */}
+          {uploadFiles.length > 0 && (
+            <div className="rounded-lg border border-borderline bg-canvas p-3 space-y-2 text-xs">
+              <div className="flex items-center justify-between text-slate-200">
+                <span className="font-medium">
+                  Ready: {uploadPlan.validItems.length} file(s) (
+                  {(uploadPlan.totalBytes / (1024 * 1024)).toFixed(2)} MB)
+                </span>
+                {!uploading && (
+                  <button
+                    type="button"
+                    onClick={() => setUploadFiles([])}
+                    className="text-[11px] text-slate-400 hover:text-slate-200"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
+              {uploadPlan.validItems.length > 0 && (
+                <div className="max-h-24 overflow-y-auto space-y-0.5 font-mono text-[11px] text-slate-400">
+                  {uploadPlan.validItems.slice(0, 5).map((item) => (
+                    <div key={item.targetPath} className="truncate">
+                      -&gt; /{item.targetPath}
+                    </div>
+                  ))}
+                  {uploadPlan.validItems.length > 5 && (
+                    <div className="text-slate-500">
+                      ...and {uploadPlan.validItems.length - 5} more file(s)
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {(uploadPlan.skippedFiltered > 0 || uploadPlan.skippedDbPhp > 0) && (
+                <div className="text-[11px] text-slate-400">
+                  Auto-skipped {uploadPlan.skippedFiltered} build/VCS file(s)
+                  {uploadPlan.skippedDbPhp > 0 ? ' and protected /db.php' : ''}.
+                </div>
+              )}
+
+              {uploadPlan.invalidPaths.length > 0 && (
+                <div className="text-[11px] text-amber-300">
+                  {uploadPlan.invalidPaths.length} file(s) contain unsupported spaces or special characters (e.g.{' '}
+                  <span className="font-mono">{uploadPlan.invalidPaths[0]}</span>). Rename them or bundle as a clean .zip.
+                </div>
+              )}
+
+              {uploadPlan.totalBytes > MAX_WEBAPP_UPLOAD_BYTES && (
+                <div className="text-[11px] text-rose-400">
+                  Total size exceeds the 100 MB limit. Remove unused assets or upload in smaller batches.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Options */}
+          {uploadMode === 'folder' && topFolderName && (
             <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
               <input
                 type="checkbox"
+                disabled={uploading}
+                checked={stripTopFolder}
+                onChange={(e) => setStripTopFolder(e.target.checked)}
+                className="rounded border-borderline bg-canvas text-accent"
+              />
+              <span>
+                Upload contents directly (strip top folder{' '}
+                <span className="font-mono text-slate-200">
+                  {topFolderName}/
+                </span>
+                )
+              </span>
+            </label>
+          )}
+
+          {uploadPlan.isSingleZip && (
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                disabled={uploading}
                 checked={extractZip}
                 onChange={(e) => setExtractZip(e.target.checked)}
                 className="rounded border-borderline bg-canvas text-accent"
               />
-              <span>Extract .zip contents into current folder</span>
+              <span>Extract .zip contents into destination folder</span>
             </label>
           )}
 
           <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
             <input
               type="checkbox"
+              disabled={uploading}
               checked={uploadAutoBuild}
               onChange={(e) => setUploadAutoBuild(e.target.checked)}
               className="rounded border-borderline bg-canvas text-accent"
@@ -980,21 +1443,53 @@ export default function SiteWorkspacePage({
             <span>Automatically run {siteType} build pipeline after upload</span>
           </label>
 
+          {/* Real-time progress bar */}
+          {uploading && uploadProgress && (
+            <div className="space-y-1.5 rounded-lg border border-borderline bg-canvas p-3">
+              <div className="flex items-center justify-between text-[11px] text-slate-300">
+                <span className="truncate pr-2">{uploadProgress.label}</span>
+                <span className="font-mono text-accent shrink-0">
+                  {uploadProgress.percent}%
+                </span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-elevated">
+                <div
+                  className="h-full bg-accent transition-all duration-200"
+                  style={{ width: `${uploadProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           <div className="flex justify-end gap-2">
             <button
               type="button"
+              disabled={uploading}
               onClick={() => setUploadOpen(false)}
-              className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs text-slate-300"
+              className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs text-slate-300 disabled:opacity-50"
             >
               Cancel
             </button>
             <button
               type="submit"
-              disabled={!uploadFile || uploading}
+              disabled={
+                uploading ||
+                uploadPlan.validItems.length === 0 ||
+                uploadPlan.invalidPaths.length > 0 ||
+                uploadPlan.totalBytes > MAX_WEBAPP_UPLOAD_BYTES
+              }
               className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-slate-950 disabled:opacity-50"
             >
               <IconPlus className="w-3.5 h-3.5" />
-              <span>{uploading ? 'Uploading...' : 'Upload'}</span>
+              <span>
+                {uploading
+                  ? `Uploading (${uploadProgress?.percent ?? 0}%)...`
+                  : uploadPlan.isSingleZip && extractZip
+                    ? 'Upload & Extract'
+                    : uploadPlan.validItems.length > 1
+                      ? `Upload ${uploadPlan.validItems.length} Files`
+                      : 'Upload'}
+              </span>
             </button>
           </div>
         </form>

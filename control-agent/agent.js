@@ -76,6 +76,7 @@ const MUTATING_ACTIONS = new Set([
   'tunnel.restart',
   'files.write',
   'files.upload',
+  'files.uploadFinish',
   'files.mkdir',
   'files.rename',
   'files.delete',
@@ -715,9 +716,132 @@ function parseJsonSafe(text) {
 const MAX_READ_BYTES = 1024 * 1024;
 const MAX_WRITE_BYTES = 2 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_TOTAL_UPLOAD_BYTES = 100 * 1024 * 1024;
+const UPLOAD_TMP_DIR = '/tmp/dp-uploads';
+const UPLOAD_ID_RE = /^[a-f0-9]{32}$/;
 const GIT_URL_RE = /^(?:https:\/\/[a-zA-Z0-9._~:/?#@!$&'()*+,;=%-]+|git@[a-zA-Z0-9.-]+:[a-zA-Z0-9._/-]+)$/;
 const GIT_BRANCH_RE = /^[a-zA-Z0-9._/-]{1,64}$/;
 const SAFE_FILENAME_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+
+function pruneStaleUploads() {
+  if (!fs.existsSync(UPLOAD_TMP_DIR)) return;
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const entry of fs.readdirSync(UPLOAD_TMP_DIR)) {
+    const p = path.join(UPLOAD_TMP_DIR, entry);
+    try {
+      const st = fs.statSync(p);
+      if (st.mtimeMs < cutoff) {
+        fs.rmSync(p, { recursive: true, force: true });
+      }
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function chownDirChain(siteRoot, leafDir, uid, gid) {
+  let cursor = leafDir;
+  while (cursor !== siteRoot && cursor.startsWith(`${siteRoot}${path.sep}`)) {
+    chownPathNoFollow(cursor, uid, gid);
+    cursor = path.dirname(cursor);
+  }
+}
+
+async function installUploadedFile({
+  name,
+  dir,
+  filename,
+  buffer,
+  sourcePath,
+  extractZip,
+  triggerBuild,
+}) {
+  if (!SAFE_FILENAME_RE.test(filename) || filename === '.' || filename === '..') {
+    throw new Error('Invalid filename: use 1-128 characters [a-zA-Z0-9._-]');
+  }
+
+  const cleanDir = String(dir || '').replace(/\/+$/g, '');
+  const relTarget = cleanDir ? `${cleanDir}/${filename}` : filename;
+  const { siteRoot, targetPath, relPath } = resolveJailedPath(name, relTarget, {
+    allowRoot: false,
+    allowMissingLeaf: true,
+    protectDbPhp: true,
+  });
+
+  const parentDir = path.dirname(targetPath);
+  fs.mkdirSync(parentDir, { recursive: true, mode: 0o755 });
+
+  const { uid, gid } = getWwwDataIds();
+  chownDirChain(siteRoot, parentDir, uid, gid);
+
+  const totalBytes = sourcePath ? fs.statSync(sourcePath).size : buffer.length;
+  let extractedFiles = 0;
+
+  if (extractZip && filename.toLowerCase().endsWith('.zip')) {
+    const unzipBin = findExecutable(['/usr/bin/unzip', '/usr/local/bin/unzip']);
+    if (!unzipBin) {
+      throw new Error('unzip is not installed on the server (apt install unzip)');
+    }
+    const stageDir = fs.mkdtempSync('/tmp/dp-unzip-');
+    const zipTmp = sourcePath || path.join(stageDir, 'upload.zip');
+    const extractDir = path.join(stageDir, 'out');
+    fs.mkdirSync(extractDir, { mode: 0o755 });
+    try {
+      if (!sourcePath) {
+        fs.writeFileSync(zipTmp, buffer, { mode: 0o600 });
+      }
+      await execFileAsync(unzipBin, ['-q', '-o', zipTmp, '-d', extractDir], {
+        shell: false,
+        timeout: 120_000,
+      });
+
+      const copySafe = (srcDir, destDir) => {
+        for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+          const s = path.join(srcDir, entry.name);
+          const d = path.join(destDir, entry.name);
+          const lst = fs.lstatSync(s);
+          if (lst.isSymbolicLink()) {
+            throw new Error(`Zip archive contains forbidden symlink: ${entry.name}`);
+          }
+          if (destDir === siteRoot && entry.name === 'db.php') {
+            continue;
+          }
+          if (lst.isDirectory()) {
+            fs.mkdirSync(d, { recursive: true, mode: 0o755 });
+            chownPathNoFollow(d, uid, gid);
+            copySafe(s, d);
+          } else {
+            fs.copyFileSync(s, d);
+            fs.chmodSync(d, entry.name.startsWith('.env') ? 0o640 : 0o644);
+            chownPathNoFollow(d, uid, gid);
+            extractedFiles += 1;
+          }
+        }
+      };
+      copySafe(extractDir, parentDir);
+    } finally {
+      fs.rmSync(stageDir, { recursive: true, force: true });
+    }
+  } else {
+    if (sourcePath) {
+      fs.copyFileSync(sourcePath, targetPath);
+      fs.chmodSync(targetPath, filename.startsWith('.env') ? 0o640 : 0o644);
+    } else {
+      fs.writeFileSync(targetPath, buffer, {
+        mode: filename.startsWith('.env') ? 0o640 : 0o644,
+      });
+    }
+    chownPathNoFollow(targetPath, uid, gid);
+  }
+
+  const build = triggerBuild ? await runSiteBuild(name, 'upload') : null;
+  return {
+    path: relPath,
+    bytes: totalBytes,
+    extractedFiles,
+    build,
+  };
+}
 
 const WATCH_IGNORED_DIRS = new Set([
   'node_modules',
@@ -1934,9 +2058,6 @@ async function handleAction(action, params = {}, socket = null) {
     case 'files.upload': {
       const name = validateName(params.name, 'site name');
       const filename = typeof params.filename === 'string' ? params.filename.trim() : '';
-      if (!SAFE_FILENAME_RE.test(filename) || filename === '.' || filename === '..') {
-        throw new Error('Invalid filename: use 1-128 characters [a-zA-Z0-9._-]');
-      }
       if (typeof params.contentBase64 !== 'string') {
         throw new Error('contentBase64 must be a string');
       }
@@ -1945,80 +2066,82 @@ async function handleAction(action, params = {}, socket = null) {
         throw new Error(`Upload exceeds ${MAX_UPLOAD_BYTES} byte limit`);
       }
 
-      const relTarget = params.dir ? `${String(params.dir).replace(/\/+$/, '')}/${filename}` : filename;
-      const { siteRoot, targetPath, relPath } = resolveJailedPath(name, relTarget, {
-        allowRoot: false,
-        allowMissingLeaf: true,
-        protectDbPhp: true,
+      const result = await installUploadedFile({
+        name,
+        dir: params.dir,
+        filename,
+        buffer: buf,
+        sourcePath: null,
+        extractZip: Boolean(params.extractZip),
+        triggerBuild: params.triggerBuild !== false,
       });
-      const parentDir = path.dirname(targetPath);
-      fs.mkdirSync(parentDir, { recursive: true, mode: 0o755 });
+      return { ok: true, stdout: JSON.stringify(result), stderr: '' };
+    }
 
-      const { uid, gid } = getWwwDataIds();
-      let extractedFiles = 0;
+    case 'files.uploadStart': {
+      validateName(params.name, 'site name');
+      pruneStaleUploads();
+      fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true, mode: 0o700 });
+      const uploadId = crypto.randomBytes(16).toString('hex');
+      const partPath = path.join(UPLOAD_TMP_DIR, `${uploadId}.part`);
+      fs.writeFileSync(partPath, Buffer.alloc(0), { mode: 0o600 });
+      return { ok: true, stdout: JSON.stringify({ uploadId }), stderr: '' };
+    }
 
-      if (Boolean(params.extractZip) && filename.toLowerCase().endsWith('.zip')) {
-        const unzipBin = findExecutable(['/usr/bin/unzip', '/usr/local/bin/unzip']);
-        if (!unzipBin) {
-          throw new Error('unzip is not installed on the server (apt install unzip)');
-        }
-        const stageDir = fs.mkdtempSync('/tmp/dp-unzip-');
-        const zipTmp = path.join(stageDir, 'upload.zip');
-        const extractDir = path.join(stageDir, 'out');
-        fs.mkdirSync(extractDir, { mode: 0o755 });
-        try {
-          fs.writeFileSync(zipTmp, buf, { mode: 0o600 });
-          await execFileAsync(unzipBin, ['-q', '-o', zipTmp, '-d', extractDir], {
-            shell: false,
-            timeout: 60_000,
-          });
-          // Walk staged files safely, blocking symlinks and protecting siteRoot/db.php
-          const copySafe = (srcDir, destDir) => {
-            for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
-              const s = path.join(srcDir, entry.name);
-              const d = path.join(destDir, entry.name);
-              const lst = fs.lstatSync(s);
-              if (lst.isSymbolicLink()) {
-                throw new Error(`Zip archive contains forbidden symlink: ${entry.name}`);
-              }
-              if (destDir === siteRoot && entry.name === 'db.php') {
-                continue;
-              }
-              if (lst.isDirectory()) {
-                fs.mkdirSync(d, { recursive: true, mode: 0o755 });
-                chownPathNoFollow(d, uid, gid);
-                copySafe(s, d);
-              } else {
-                fs.copyFileSync(s, d);
-                fs.chmodSync(d, entry.name.startsWith('.env') ? 0o640 : 0o644);
-                chownPathNoFollow(d, uid, gid);
-                extractedFiles += 1;
-              }
-            }
-          };
-          copySafe(extractDir, parentDir);
-        } finally {
-          fs.rmSync(stageDir, { recursive: true, force: true });
-        }
-      } else {
-        fs.writeFileSync(targetPath, buf, {
-          mode: filename.startsWith('.env') ? 0o640 : 0o644,
-        });
-        chownPathNoFollow(targetPath, uid, gid);
+    case 'files.uploadChunk': {
+      const uploadId = typeof params.uploadId === 'string' ? params.uploadId.trim() : '';
+      if (!UPLOAD_ID_RE.test(uploadId)) {
+        throw new Error('Invalid uploadId');
       }
-
-      const triggerBuild = params.triggerBuild !== false;
-      const build = triggerBuild ? await runSiteBuild(name, 'upload') : null;
+      const partPath = path.join(UPLOAD_TMP_DIR, `${uploadId}.part`);
+      if (!fs.existsSync(partPath)) {
+        throw new Error('Upload session expired or not found');
+      }
+      if (typeof params.contentBase64 !== 'string') {
+        throw new Error('contentBase64 must be a string');
+      }
+      const chunkBuf = Buffer.from(params.contentBase64, 'base64');
+      if (chunkBuf.length > 4 * 1024 * 1024) {
+        throw new Error('Upload chunk exceeds 4 MB limit');
+      }
+      const currentSize = fs.statSync(partPath).size;
+      if (currentSize + chunkBuf.length > MAX_TOTAL_UPLOAD_BYTES) {
+        fs.rmSync(partPath, { force: true });
+        throw new Error(`Total upload exceeds ${MAX_TOTAL_UPLOAD_BYTES} byte (100 MB) limit`);
+      }
+      fs.appendFileSync(partPath, chunkBuf);
       return {
         ok: true,
-        stdout: JSON.stringify({
-          path: relPath,
-          bytes: buf.length,
-          extractedFiles,
-          build,
-        }),
+        stdout: JSON.stringify({ bytesWritten: currentSize + chunkBuf.length }),
         stderr: '',
       };
+    }
+
+    case 'files.uploadFinish': {
+      const name = validateName(params.name, 'site name');
+      const uploadId = typeof params.uploadId === 'string' ? params.uploadId.trim() : '';
+      if (!UPLOAD_ID_RE.test(uploadId)) {
+        throw new Error('Invalid uploadId');
+      }
+      const partPath = path.join(UPLOAD_TMP_DIR, `${uploadId}.part`);
+      if (!fs.existsSync(partPath)) {
+        throw new Error('Upload session expired or not found');
+      }
+      const filename = typeof params.filename === 'string' ? params.filename.trim() : '';
+      try {
+        const result = await installUploadedFile({
+          name,
+          dir: params.dir,
+          filename,
+          buffer: null,
+          sourcePath: partPath,
+          extractZip: Boolean(params.extractZip),
+          triggerBuild: params.triggerBuild !== false,
+        });
+        return { ok: true, stdout: JSON.stringify(result), stderr: '' };
+      } finally {
+        fs.rmSync(partPath, { force: true });
+      }
     }
 
     case 'files.mkdir': {

@@ -19,6 +19,9 @@ export type AgentAction =
   | 'files.read'
   | 'files.write'
   | 'files.upload'
+  | 'files.uploadStart'
+  | 'files.uploadChunk'
+  | 'files.uploadFinish'
   | 'files.mkdir'
   | 'files.rename'
   | 'files.delete'
@@ -82,6 +85,7 @@ export async function callControlAgent(
     timeoutMs ??
     (action === 'files.write' ||
     action === 'files.upload' ||
+    action === 'files.uploadFinish' ||
     action === 'site.git' ||
     action === 'site.build'
       ? 305_000

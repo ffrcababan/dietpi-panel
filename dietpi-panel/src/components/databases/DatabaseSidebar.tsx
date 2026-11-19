@@ -4,8 +4,6 @@ import React from 'react';
 import {
   IconDatabase,
   IconEye,
-  IconPanelLeftClose,
-  IconPanelLeftOpen,
   IconPlus,
   IconSearch,
   IconTable,
@@ -19,8 +17,6 @@ export const DatabaseSidebar = React.memo(function DatabaseSidebar({
   filteredTables,
   selectedTable,
   tableFilter,
-  collapsed,
-  onToggleCollapse,
   onChangeFilter,
   onSelectTable,
   onCreateTable,
@@ -30,66 +26,11 @@ export const DatabaseSidebar = React.memo(function DatabaseSidebar({
   filteredTables: DbTableInfo[];
   selectedTable: string;
   tableFilter: string;
-  collapsed: boolean;
-  onToggleCollapse: () => void;
   onChangeFilter: (val: string) => void;
   onSelectTable: (tableName: string) => void;
   onCreateTable: () => void;
   onDropTable: (table: DbTableInfo) => void;
 }) {
-  if (collapsed) {
-    return (
-      <aside className="rounded-xl border border-borderline bg-surface overflow-hidden flex flex-col items-center py-3 px-1.5 gap-3 lg:w-14 shrink-0 self-start">
-        <button
-          type="button"
-          onClick={onToggleCollapse}
-          title="Expand tables explorer"
-          aria-label="Expand tables explorer"
-          className="flex h-8 w-8 items-center justify-center rounded-lg border border-borderline bg-canvas text-slate-300 hover:border-accent/60 hover:text-accent transition"
-        >
-          <IconPanelLeftOpen className="w-4 h-4" />
-        </button>
-
-        <div className="h-px w-7 bg-borderline" />
-
-        <button
-          type="button"
-          onClick={onCreateTable}
-          title="Create New Table"
-          aria-label="Create New Table"
-          className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent/15 border border-accent/35 text-accent hover:bg-accent/25 transition"
-        >
-          <IconPlus className="w-4 h-4" />
-        </button>
-
-        <div className="flex flex-col items-center gap-1 max-h-[54vh] overflow-y-auto w-full px-0.5">
-          {tables.map((t) => {
-            const active = selectedTable === t.name;
-            return (
-              <button
-                key={t.name}
-                type="button"
-                onClick={() => onSelectTable(t.name)}
-                title={`${t.name} (${t.rowCount} rows)`}
-                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition ${
-                  active
-                    ? 'bg-accent/20 text-accent ring-1 ring-accent/40'
-                    : 'text-slate-400 hover:bg-elevated hover:text-slate-100'
-                }`}
-              >
-                {t.type === 'view' ? (
-                  <IconEye className="w-3.5 h-3.5" />
-                ) : (
-                  <IconTable className="w-3.5 h-3.5" />
-                )}
-              </button>
-            );
-          })}
-        </div>
-      </aside>
-    );
-  }
-
   return (
     <aside className="w-full lg:w-72 xl:w-80 shrink-0 rounded-xl border border-borderline bg-surface overflow-hidden flex flex-col self-start">
       <div className="flex items-center justify-between gap-2 border-b border-borderline bg-canvas/60 px-3.5 py-2.5">
@@ -103,25 +44,14 @@ export const DatabaseSidebar = React.memo(function DatabaseSidebar({
           </span>
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
-          <button
-            type="button"
-            onClick={onCreateTable}
-            className="inline-flex items-center gap-1 rounded-lg border border-borderline bg-elevated px-2 py-1 text-[11px] font-medium text-slate-200 hover:border-accent/60 hover:text-accent transition"
-          >
-            <IconPlus className="w-3 h-3" />
-            <span>Table</span>
-          </button>
-          <button
-            type="button"
-            onClick={onToggleCollapse}
-            title="Collapse tables explorer"
-            aria-label="Collapse tables explorer"
-            className="hidden lg:flex h-7 w-7 items-center justify-center rounded-lg border border-borderline bg-canvas text-slate-400 hover:border-slate-500 hover:text-slate-100 transition"
-          >
-            <IconPanelLeftClose className="w-3.5 h-3.5" />
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={onCreateTable}
+          className="inline-flex items-center gap-1 rounded-lg border border-borderline bg-elevated px-2.5 py-1 text-[11px] font-medium text-slate-200 hover:border-accent/60 hover:text-accent transition shrink-0"
+        >
+          <IconPlus className="w-3 h-3" />
+          <span>Table</span>
+        </button>
       </div>
 
       {tables.length > 4 && (

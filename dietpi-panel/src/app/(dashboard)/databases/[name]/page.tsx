@@ -56,7 +56,6 @@ export default function DatabaseStudioPage({
   const sqlHistoryKey = `dp_sql_hist_${dbName}`;
 
   const [tab, setTab] = useState<StudioTab>('data');
-  const [tablesCollapsed, setTablesCollapsed] = useState(false);
   const [tableFilter, setTableFilter] = useState('');
   const [selectedTable, setSelectedTable] = useState('');
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
@@ -565,14 +564,12 @@ export default function DatabaseStudioPage({
         </div>
       ) : (
         <div className="flex flex-col lg:flex-row gap-5 items-start">
-          {/* Collapsible Tables Explorer */}
+          {/* Tables & Views Explorer */}
           <DatabaseSidebar
             tables={tables}
             filteredTables={filteredTables}
             selectedTable={selectedTable}
             tableFilter={tableFilter}
-            collapsed={tablesCollapsed}
-            onToggleCollapse={() => setTablesCollapsed((c) => !c)}
             onChangeFilter={setTableFilter}
             onSelectTable={selectTable}
             onCreateTable={() => setCreateTableOpen(true)}

@@ -103,12 +103,12 @@ fi
 mkdir -p /srv/db /srv/db/_panel /srv/db/backups /srv/backups/sites
 mkdir -p /var/www/_shared
 mkdir -p /etc/apache2/conf-app-db /etc/control-agent /etc/dietpi-panel
-mkdir -p /opt/control-agent /opt/dietpi-panel
+mkdir -p /opt/control-agent /opt/dietpi-panel /var/log/dietpi-panel-builds
 
 chmod 0755 /srv/db /var/www/_shared
 chown panel:panel /srv/db/_panel
 chmod 0750 /srv/db/_panel
-chmod 0750 /srv/db/backups /srv/backups/sites /etc/apache2/conf-app-db /etc/control-agent /opt/control-agent
+chmod 0750 /srv/db/backups /srv/backups/sites /etc/apache2/conf-app-db /etc/control-agent /opt/control-agent /var/log/dietpi-panel-builds
 chown root:panel /etc/dietpi-panel
 chmod 0750 /etc/dietpi-panel
 
@@ -120,10 +120,11 @@ for script_name in mkdb listdb mksite listsites; do
     install -m 0755 -o root -g root "${REPO_DIR}/scripts/${script_name}" "/usr/local/bin/${script_name}"
 done
 
-for tmpl in vhost-static.conf vhost-php.conf vhost-nextjs.conf vhost-dbonly.conf vhost-panel.conf; do
+for tmpl in vhost-static.conf vhost-php.conf vhost-laravel.conf vhost-spa.conf vhost-proxy.conf vhost-nextjs.conf vhost-dbonly.conf vhost-panel.conf; do
     install -m 0644 -o root -g root "${REPO_DIR}/templates/apache/${tmpl}" "/etc/skel/${tmpl}"
 done
 install -m 0644 -o root -g root "${REPO_DIR}/templates/systemd/app-nextjs.service.tmpl" /etc/skel/app-nextjs.service.tmpl
+install -m 0644 -o root -g root "${REPO_DIR}/templates/systemd/app-service.tmpl" /etc/skel/app-service.tmpl
 
 install -m 0750 -o root -g root "${REPO_DIR}/control-agent/agent.js" /opt/control-agent/agent.js
 

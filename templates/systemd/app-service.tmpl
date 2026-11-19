@@ -1,0 +1,23 @@
+[Unit]
+Description=DietPi App (__NAME__ - __TYPE__)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/__NAME__
+Environment=NODE_ENV=production
+Environment=PORT=__PORT__
+Environment=HOSTNAME=127.0.0.1
+Environment=HOME=/tmp
+EnvironmentFile=-/var/www/__NAME__/__ENV_FILE__
+ExecStart=__EXEC_START__
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

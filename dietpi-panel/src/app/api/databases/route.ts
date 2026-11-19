@@ -36,7 +36,15 @@ export async function GET() {
       resp,
       'Failed to list databases'
     );
-    return NextResponse.json({ databases });
+    return NextResponse.json(
+      { databases },
+      {
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+          Pragma: 'no-cache',
+        },
+      }
+    );
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : 'Failed to list databases' },

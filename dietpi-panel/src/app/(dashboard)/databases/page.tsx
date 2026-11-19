@@ -2,14 +2,13 @@
 
 import React, { useState } from 'react';
 import useSWR from 'swr';
-import {
-  IconCheck,
-  IconCopy,
-  IconPlus,
-  IconTrash,
-} from '@/components/Icons';
+import { IconPlus, IconTrash } from '@/components/Icons';
 import { Modal } from '@/components/Modal';
 import { usePanel } from '@/components/PanelContext';
+import {
+  RevealKeyModal,
+  type ProvisionedDatabaseInfo,
+} from '@/components/RevealKeyModal';
 import { StatusBadge } from '@/components/StatusBadge';
 import { apiFetcher, apiMutate } from '@/lib/client-api';
 import type { TunnelActionResult } from '@/lib/agent';
@@ -33,8 +32,7 @@ export default function DatabasesPage() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  const [createdInfo, setCreatedInfo] = useState<CreateDatabaseResult | null>(null);
-  const [copiedField, setCopiedField] = useState<'key' | 'curl' | null>(null);
+  const [createdInfo, setCreatedInfo] = useState<ProvisionedDatabaseInfo | null>(null);
 
   const [deleteTarget, setDeleteTarget] = useState<DatabaseRecord | null>(null);
   const [confirmName, setConfirmName] = useState('');
@@ -111,20 +109,6 @@ export default function DatabasesPage() {
       setDeleting(false);
     }
   };
-
-  const copyText = async (text: string, field: 'key' | 'curl') => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedField(field);
-      setTimeout(() => setCopiedField(null), 2000);
-    } catch {
-      // Clipboard blocked in non-HTTPS test contexts
-    }
-  };
-
-  const curlSnippet = createdInfo
-    ? `curl -s -X POST https://${createdInfo.domain}/db.php \\\n  -H "Content-Type: application/json" \\\n  -H "x-api-key: ${createdInfo.apiKey}" \\\n  -d '{"sql":"SELECT sqlite_version() AS version"}'`
-    : '';
 
   return (
     <div className="space-y-6">
@@ -310,103 +294,7 @@ export default function DatabasesPage() {
       </Modal>
 
       {/* Reveal-Once API Key Modal */}
-      <Modal
-        open={Boolean(createdInfo)}
-        title="Database Provisioned — Copy Your API Key"
-        subtitle="Store this key securely now. It is stored only in root-protected Apache config and will never be displayed again."
-        onClose={() => setCreatedInfo(null)}
-        maxWidthClass="max-w-xl"
-      >
-        {createdInfo && (
-          <div className="space-y-4">
-            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-200">
-              Reveal-once secret: closing this dialog permanently hides the API key.
-            </div>
-
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="text-xs font-medium text-slate-300">
-                  x-api-key for <span className="font-mono text-slate-100">{createdInfo.name}</span>
-                </span>
-                <button
-                  type="button"
-                  onClick={() => copyText(createdInfo.apiKey, 'key')}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-borderline bg-elevated px-2.5 py-1 text-xs text-slate-200 hover:border-slate-500"
-                >
-                  {copiedField === 'key' ? (
-                    <>
-                      <IconCheck className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Copied</span>
-                    </>
-                  ) : (
-                    <>
-                      <IconCopy className="w-3.5 h-3.5" />
-                      <span>Copy Key</span>
-                    </>
-                  )}
-                </button>
-              </div>
-              <div className="rounded-lg border border-borderline bg-canvas p-3 font-mono text-xs text-emerald-300 break-all select-all">
-                {createdInfo.apiKey}
-              </div>
-            </div>
-
-            {(() => {
-              const summary = formatTunnelSummary(createdInfo.tunnel);
-              if (!summary) return null;
-              return (
-                <div
-                  className={`rounded-lg border px-3.5 py-2 text-xs ${
-                    summary.ok
-                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
-                      : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
-                  }`}
-                >
-                  {summary.text}
-                </div>
-              );
-            })()}
-
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="text-xs font-medium text-slate-300">
-                  Verify with curl
-                </span>
-                <button
-                  type="button"
-                  onClick={() => copyText(curlSnippet, 'curl')}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-borderline bg-elevated px-2.5 py-1 text-xs text-slate-200 hover:border-slate-500"
-                >
-                  {copiedField === 'curl' ? (
-                    <>
-                      <IconCheck className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Copied</span>
-                    </>
-                  ) : (
-                    <>
-                      <IconCopy className="w-3.5 h-3.5" />
-                      <span>Copy curl</span>
-                    </>
-                  )}
-                </button>
-              </div>
-              <pre className="rounded-lg border border-borderline bg-canvas p-3 font-mono text-[11px] text-slate-300 overflow-x-auto">
-                {curlSnippet}
-              </pre>
-            </div>
-
-            <div className="flex justify-end pt-2">
-              <button
-                type="button"
-                onClick={() => setCreatedInfo(null)}
-                className="rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-accent-hover transition"
-              >
-                I Have Saved the Key
-              </button>
-            </div>
-          </div>
-        )}
-      </Modal>
+      <RevealKeyModal info={createdInfo} onClose={() => setCreatedInfo(null)} />
 
       {/* Type-to-Confirm Delete Modal */}
       <Modal

@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # mksite <name> <type> [domain] [port]
-# Creates an Apache vhost from /etc/skel/vhost-<type>.conf, docroot /var/www/<name>,
-# symlinks /var/www/_shared/db.php, enables site, and reloads Apache.
+# Creates an Apache vhost, docroot /var/www/<name>, aliases /db.php,
+# creates a systemd service template for runtime apps (nextjs, node, python),
+# enables the site, and reloads Apache.
 
 if [[ -f /etc/control-agent/config.env ]]; then
     # shellcheck disable=SC1091
@@ -27,8 +28,8 @@ case "$NAME" in
         ;;
 esac
 
-if [[ ! "$TYPE" =~ ^(static|php|nextjs)$ ]]; then
-    echo "Invalid site type: must be static, php, or nextjs" >&2
+if [[ ! "$TYPE" =~ ^(static|php|laravel|react|vue|astro|sveltekit|nextjs|node|python)$ ]]; then
+    echo "Invalid site type: must be one of static, php, laravel, react, vue, astro, sveltekit, nextjs, node, python" >&2
     exit 1
 fi
 
@@ -48,16 +49,9 @@ if [[ "$DOMAIN" == "panel.${BASE_DOMAIN}" ]]; then
     exit 1
 fi
 
-SKEL_VHOST="/etc/skel/vhost-${TYPE}.conf"
-SKEL_SYSTEMD="/etc/skel/app-nextjs.service.tmpl"
 VHOST_FILE="/etc/apache2/sites-available/${NAME}.conf"
-DOCROOT="/var/www/${NAME}"
+SITE_ROOT="/var/www/${NAME}"
 SHARED_DB_PHP="/var/www/_shared/db.php"
-
-if [[ ! -f "$SKEL_VHOST" ]]; then
-    echo "Template missing: $SKEL_VHOST" >&2
-    exit 1
-fi
 
 if [[ ! -f "$SHARED_DB_PHP" ]]; then
     echo "Shared endpoint missing: $SHARED_DB_PHP" >&2
@@ -85,11 +79,16 @@ for existing_conf in /etc/apache2/sites-available/*.conf; do
 done
 shopt -u nullglob
 
+IS_PROXY=0
+if [[ "$TYPE" == "nextjs" || "$TYPE" == "node" || "$TYPE" == "python" ]]; then
+    IS_PROXY=1
+fi
+
 PORT="0"
-if [[ "$TYPE" == "nextjs" ]]; then
+if (( IS_PROXY == 1 )); then
     if [[ -n "$REQUESTED_PORT" ]]; then
         if [[ ! "$REQUESTED_PORT" =~ ^[0-9]+$ ]] || (( REQUESTED_PORT < 3001 || REQUESTED_PORT > 39999 )); then
-            echo "Invalid port for nextjs site: must be integer 3001..39999" >&2
+            echo "Invalid port for ${TYPE} site: must be integer 3001..39999" >&2
             exit 1
         fi
         PORT="$REQUESTED_PORT"
@@ -112,25 +111,57 @@ if [[ "$TYPE" == "nextjs" ]]; then
     fi
 fi
 
-mkdir -p "$DOCROOT"
-chown www-data:www-data "$DOCROOT"
-chmod 0755 "$DOCROOT"
-ln -sfn "$SHARED_DB_PHP" "${DOCROOT}/db.php"
+# Determine docroot and template
+DOCROOT="$SITE_ROOT"
+FALLBACK_DIRECTIVE=""
+SKEL_VHOST="/etc/skel/vhost-${TYPE}.conf"
 
-if [[ "$TYPE" == "static" && ! -f "${DOCROOT}/index.html" ]]; then
-    cat > "${DOCROOT}/index.html" <<EOF
-<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>${DOMAIN}</title></head>
-<body style="font-family:system-ui,sans-serif;background:#0b0e14;color:#e2e8f0;padding:3rem">
-<h1>${DOMAIN}</h1>
-<p>Static site <code>${NAME}</code> is live on DietPi Panel.</p>
-</body>
-</html>
-EOF
-    chown www-data:www-data "${DOCROOT}/index.html"
-elif [[ "$TYPE" == "php" && ! -f "${DOCROOT}/index.php" && ! -f "${DOCROOT}/index.html" ]]; then
-    cat > "${DOCROOT}/index.php" <<EOF
+case "$TYPE" in
+    static|php)
+        DOCROOT="$SITE_ROOT"
+        ;;
+    laravel)
+        DOCROOT="${SITE_ROOT}/public"
+        ;;
+    react|vue)
+        DOCROOT="${SITE_ROOT}/dist"
+        FALLBACK_DIRECTIVE="FallbackResource /index.html"
+        SKEL_VHOST="/etc/skel/vhost-spa.conf"
+        ;;
+    astro)
+        DOCROOT="${SITE_ROOT}/dist"
+        FALLBACK_DIRECTIVE=""
+        SKEL_VHOST="/etc/skel/vhost-spa.conf"
+        ;;
+    sveltekit)
+        DOCROOT="${SITE_ROOT}/build"
+        FALLBACK_DIRECTIVE="FallbackResource /index.html"
+        SKEL_VHOST="/etc/skel/vhost-spa.conf"
+        ;;
+    nextjs)
+        DOCROOT="$SITE_ROOT"
+        SKEL_VHOST="/etc/skel/vhost-nextjs.conf"
+        ;;
+    node|python)
+        DOCROOT="$SITE_ROOT"
+        SKEL_VHOST="/etc/skel/vhost-proxy.conf"
+        ;;
+esac
+
+if [[ ! -f "$SKEL_VHOST" ]]; then
+    echo "Template missing: $SKEL_VHOST" >&2
+    exit 1
+fi
+
+mkdir -p "$SITE_ROOT" "$DOCROOT"
+chown -R www-data:www-data "$SITE_ROOT"
+chmod 0755 "$SITE_ROOT" "$DOCROOT"
+ln -sfn "$SHARED_DB_PHP" "${SITE_ROOT}/db.php"
+
+# Seed a clean placeholder entrypoint when empty
+if [[ "$TYPE" == "php" ]]; then
+    if [[ ! -f "${DOCROOT}/index.php" && ! -f "${DOCROOT}/index.html" ]]; then
+        cat > "${DOCROOT}/index.php" <<EOF
 <?php
 header('Content-Type: text/html; charset=utf-8');
 ?>
@@ -143,25 +174,62 @@ header('Content-Type: text/html; charset=utf-8');
 </body>
 </html>
 EOF
-    chown www-data:www-data "${DOCROOT}/index.php"
-elif [[ "$TYPE" == "nextjs" ]]; then
-    if [[ ! -f "${DOCROOT}/README-NEXTJS.txt" ]]; then
-        cat > "${DOCROOT}/README-NEXTJS.txt" <<EOF
-Next.js site "${NAME}" (${DOMAIN})
-Assigned internal port: ${PORT}
-Systemd unit: /etc/systemd/system/app-${NAME}.service
-
-Deploy your built Next.js app into ${DOCROOT}, run npm install && npm run build,
-then start the service:
-  systemctl enable --now app-${NAME}.service
-
-Note: /db.php is excluded from ProxyPass and handled directly by Apache + PHP.
-EOF
-        chown www-data:www-data "${DOCROOT}/README-NEXTJS.txt"
+        chown www-data:www-data "${DOCROOT}/index.php"
     fi
+elif [[ "$TYPE" == "laravel" ]]; then
+    if [[ ! -f "${DOCROOT}/index.php" ]]; then
+        cat > "${DOCROOT}/index.php" <<EOF
+<?php
+header('Content-Type: text/html; charset=utf-8');
+?>
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title><?= htmlspecialchars('${DOMAIN}') ?></title></head>
+<body style="font-family:system-ui,sans-serif;background:#0b0e14;color:#e2e8f0;padding:3rem">
+<h1><?= htmlspecialchars('${DOMAIN}') ?></h1>
+<p>Laravel document root <code>${DOCROOT}</code> is ready. Upload or git-clone your Laravel project into <code>${SITE_ROOT}</code>.</p>
+</body>
+</html>
+EOF
+        chown www-data:www-data "${DOCROOT}/index.php"
+    fi
+elif (( IS_PROXY == 0 )); then
+    if [[ ! -f "${DOCROOT}/index.html" ]]; then
+        cat > "${DOCROOT}/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>${DOMAIN}</title></head>
+<body style="font-family:system-ui,sans-serif;background:#0b0e14;color:#e2e8f0;padding:3rem">
+<h1>${DOMAIN}</h1>
+<p>${TYPE} site <code>${NAME}</code> is live on DietPi Panel.</p>
+</body>
+</html>
+EOF
+        chown www-data:www-data "${DOCROOT}/index.html"
+    fi
+else
     SYSTEMD_UNIT="/etc/systemd/system/app-${NAME}.service"
-    if [[ ! -f "$SYSTEMD_UNIT" && -f "$SKEL_SYSTEMD" ]]; then
-        sed -e "s|__NAME__|${NAME}|g" -e "s|__PORT__|${PORT}|g" "$SKEL_SYSTEMD" > "$SYSTEMD_UNIT"
+    SKEL_SERVICE="/etc/skel/app-service.tmpl"
+    if [[ ! -f "$SKEL_SERVICE" ]]; then
+        SKEL_SERVICE="/etc/skel/app-nextjs.service.tmpl"
+    fi
+    if [[ "$TYPE" == "nextjs" ]]; then
+        ENV_FILE=".env.local"
+        EXEC_START="/usr/bin/env npm run start"
+    elif [[ "$TYPE" == "node" ]]; then
+        ENV_FILE=".env"
+        EXEC_START="/usr/bin/env npm run start"
+    else
+        ENV_FILE=".env"
+        EXEC_START="${SITE_ROOT}/.venv/bin/python ${SITE_ROOT}/app.py"
+    fi
+    if [[ ! -f "$SYSTEMD_UNIT" && -f "$SKEL_SERVICE" ]]; then
+        sed -e "s|__NAME__|${NAME}|g" \
+            -e "s|__TYPE__|${TYPE}|g" \
+            -e "s|__PORT__|${PORT}|g" \
+            -e "s|__ENV_FILE__|${ENV_FILE}|g" \
+            -e "s|__EXEC_START__|${EXEC_START}|g" \
+            "$SKEL_SERVICE" > "$SYSTEMD_UNIT"
         chmod 0644 "$SYSTEMD_UNIT"
         systemctl daemon-reload
     fi
@@ -174,7 +242,10 @@ if [[ -f "$VHOST_FILE" ]]; then
 fi
 
 sed -e "s|__NAME__|${NAME}|g" \
+    -e "s|__TYPE__|${TYPE}|g" \
     -e "s|__DOMAIN__|${DOMAIN}|g" \
+    -e "s|__DOCROOT__|${DOCROOT}|g" \
+    -e "s|__FALLBACK_DIRECTIVE__|${FALLBACK_DIRECTIVE}|g" \
     -e "s|__PORT__|${PORT}|g" \
     "$SKEL_VHOST" > "$VHOST_FILE"
 chmod 0644 "$VHOST_FILE"
@@ -193,7 +264,7 @@ fi
 rm -f "$BACKUP_OLD_VHOST"
 systemctl reload apache2
 
-if [[ "$TYPE" == "nextjs" ]]; then
+if (( IS_PROXY == 1 )); then
     printf '{"name":"%s","type":"%s","domain":"%s","docroot":"%s","port":%s}\n' \
         "$NAME" "$TYPE" "$DOMAIN" "$DOCROOT" "$PORT"
 else

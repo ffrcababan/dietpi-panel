@@ -1,16 +1,28 @@
 'use client';
 
 import React, { useState } from 'react';
+import Link from 'next/link';
 import useSWR from 'swr';
 import { IconLock, IconPlus, IconTrash } from '@/components/Icons';
 import { Modal } from '@/components/Modal';
 import { usePanel } from '@/components/PanelContext';
+import {
+  RevealKeyModal,
+  type ProvisionedDatabaseInfo,
+} from '@/components/RevealKeyModal';
 import { StatusBadge } from '@/components/StatusBadge';
 import { apiFetcher, apiMutate } from '@/lib/client-api';
 import type { TunnelActionResult } from '@/lib/agent';
 import { formatTunnelSummary } from '@/lib/format';
-import { DOMAIN_RE, NAME_RE, RESERVED_NAMES, type SiteType } from '@/lib/validation';
-import type { SiteRecord } from '@/app/api/sites/route';
+import {
+  DOMAIN_RE,
+  FRAMEWORK_PRESETS,
+  NAME_RE,
+  RESERVED_NAMES,
+  SITE_TYPES,
+  type SiteType,
+} from '@/lib/validation';
+import type { CreateSiteResponse, SiteRecord } from '@/app/api/sites/route';
 
 export default function SitesPage() {
   const { me } = usePanel();
@@ -25,8 +37,14 @@ export default function SitesPage() {
   const [siteType, setSiteType] = useState<SiteType>('static');
   const [customDomain, setCustomDomain] = useState('');
   const [customPort, setCustomPort] = useState('');
+  const [createDb, setCreateDb] = useState(true);
+  const [enableWatch, setEnableWatch] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+
+  const [provisionedDb, setProvisionedDb] = useState<ProvisionedDatabaseInfo | null>(
+    null
+  );
 
   const [certOpen, setCertOpen] = useState(false);
   const [certDomain, setCertDomain] = useState('');
@@ -42,12 +60,11 @@ export default function SitesPage() {
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [routingDomain, setRoutingDomain] = useState<string | null>(null);
-  const [tunnelBanner, setTunnelBanner] = useState<{ ok: boolean; text: string } | null>(
-    null
-  );
+  const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
 
   const sites = data?.sites ?? [];
   const baseDomain = me?.baseDomain || 'mydomain.com';
+  const selectedPreset = FRAMEWORK_PRESETS[siteType];
 
   const nameError = (() => {
     if (!name) return null;
@@ -75,25 +92,50 @@ export default function SitesPage() {
 
     setCreating(true);
     setCreateError(null);
-    setTunnelBanner(null);
+    setBanner(null);
     try {
-      const res = await apiMutate<{
-        site: { tunnel?: TunnelActionResult };
-      }>('/api/sites', 'POST', me.csrfToken, {
-        name,
-        type: siteType,
-        domain: customDomain.trim() || undefined,
-        port:
-          siteType === 'nextjs' && customPort.trim()
-            ? Number.parseInt(customPort.trim(), 10)
-            : undefined,
-      });
+      const res = await apiMutate<{ site: CreateSiteResponse }>(
+        '/api/sites',
+        'POST',
+        me.csrfToken,
+        {
+          name,
+          type: siteType,
+          domain: customDomain.trim() || undefined,
+          port:
+            selectedPreset.hasPort && customPort.trim()
+              ? Number.parseInt(customPort.trim(), 10)
+              : undefined,
+          createDb,
+          watch: enableWatch,
+        }
+      );
+
       setCreateOpen(false);
       setName('');
       setCustomDomain('');
       setCustomPort('');
-      const summary = formatTunnelSummary(res.site?.tunnel);
-      if (summary) setTunnelBanner(summary);
+
+      if (res.site.database) {
+        setProvisionedDb({
+          name: res.site.database.name,
+          domain: res.site.database.domain,
+          dbPath: res.site.database.dbPath,
+          apiKey: res.site.database.apiKey,
+          envFile: res.site.envFile,
+          tunnel: res.site.tunnel,
+        });
+      } else {
+        const tunnelMsg = formatTunnelSummary(res.site.tunnel);
+        if (res.site.dbError) {
+          setBanner({ ok: false, text: `Site created, but DB error: ${res.site.dbError}` });
+        } else if (tunnelMsg) {
+          setBanner(tunnelMsg);
+        } else {
+          setBanner({ ok: true, text: `Created ${res.site.domain} (${res.site.type}).` });
+        }
+      }
+
       await mutate();
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : 'Failed to create site');
@@ -106,7 +148,7 @@ export default function SitesPage() {
     if (!me?.csrfToken || !deleteTarget) return;
     setDeleting(true);
     setDeleteError(null);
-    setTunnelBanner(null);
+    setBanner(null);
     try {
       const res = await apiMutate<{
         deleted: { tunnel?: TunnelActionResult };
@@ -117,7 +159,7 @@ export default function SitesPage() {
       );
       setDeleteTarget(null);
       const summary = formatTunnelSummary(res.deleted?.tunnel);
-      if (summary) setTunnelBanner(summary);
+      if (summary) setBanner(summary);
       await mutate();
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : 'Failed to archive site');
@@ -129,7 +171,7 @@ export default function SitesPage() {
   const handleRouteTunnel = async (domain: string) => {
     if (!me?.csrfToken || routingDomain) return;
     setRoutingDomain(domain);
-    setTunnelBanner(null);
+    setBanner(null);
     try {
       const res = await apiMutate<{ tunnel: TunnelActionResult }>(
         '/api/tunnel',
@@ -138,10 +180,10 @@ export default function SitesPage() {
         { domain }
       );
       const summary = formatTunnelSummary(res.tunnel);
-      if (summary) setTunnelBanner(summary);
+      if (summary) setBanner(summary);
       await mutate();
     } catch (err) {
-      setTunnelBanner({
+      setBanner({
         ok: false,
         text: err instanceof Error ? err.message : 'Failed to route tunnel',
       });
@@ -202,9 +244,11 @@ export default function SitesPage() {
   };
 
   const typeTone = (t: string): 'blue' | 'amber' | 'green' | 'slate' => {
-    if (t === 'nextjs') return 'blue';
-    if (t === 'php') return 'amber';
-    if (t === 'static') return 'green';
+    if (t === 'nextjs' || t === 'node' || t === 'python') return 'blue';
+    if (t === 'php' || t === 'laravel') return 'amber';
+    if (t === 'static' || t === 'react' || t === 'vue' || t === 'astro' || t === 'sveltekit') {
+      return 'green';
+    }
     return 'slate';
   };
 
@@ -213,10 +257,10 @@ export default function SitesPage() {
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-slate-100">
-            Sites &amp; Virtual Hosts
+            Sites &amp; Web Apps
           </h1>
           <p className="mt-1 text-sm text-slate-400">
-            Apache virtual hosts for static, PHP, Next.js apps, and TLS certificates.
+            Apache virtual hosts, auto-created SQLite databases, Cloudflare Tunnel routing, file management, and preset builds.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -235,6 +279,8 @@ export default function SitesPage() {
               setSiteType('static');
               setCustomDomain('');
               setCustomPort('');
+              setCreateDb(true);
+              setEnableWatch(false);
               setCreateError(null);
               setCreateOpen(true);
             }}
@@ -252,18 +298,18 @@ export default function SitesPage() {
         </div>
       )}
 
-      {tunnelBanner && (
+      {banner && (
         <div
           className={`flex items-center justify-between gap-4 rounded-xl border px-4 py-3 text-xs ${
-            tunnelBanner.ok
+            banner.ok
               ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
               : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
           }`}
         >
-          <span>{tunnelBanner.text}</span>
+          <span>{banner.text}</span>
           <button
             type="button"
-            onClick={() => setTunnelBanner(null)}
+            onClick={() => setBanner(null)}
             className="text-slate-400 hover:text-white shrink-0"
           >
             Dismiss
@@ -277,7 +323,7 @@ export default function SitesPage() {
             <thead className="border-b border-borderline bg-canvas/50 text-xs uppercase text-slate-400">
               <tr>
                 <th className="px-5 py-3 font-medium">Domain</th>
-                <th className="px-5 py-3 font-medium">Type</th>
+                <th className="px-5 py-3 font-medium">Framework</th>
                 <th className="px-5 py-3 font-medium">Tunnel</th>
                 <th className="px-5 py-3 font-medium">Origin TLS</th>
                 <th className="px-5 py-3 font-medium">Target / Docroot</th>
@@ -303,11 +349,10 @@ export default function SitesPage() {
                       >
                         {site.serverName}
                       </a>
-                      <div className="mt-0.5 flex items-center gap-2 text-[11px] text-slate-500">
+                      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
                         <span>{site.name}</span>
-                        {site.hasDb && (
-                          <span className="text-sky-400">• SQLite /db.php</span>
-                        )}
+                        {site.hasDb && <span className="text-sky-400">• SQLite</span>}
+                        {site.watch && <span className="text-emerald-400">• Watch ON</span>}
                       </div>
                     </td>
                     <td className="px-5 py-3.5">
@@ -357,7 +402,7 @@ export default function SitesPage() {
                         </div>
                       ) : null}
                     </td>
-                    <td className="px-5 py-3.5 text-right">
+                    <td className="px-5 py-3.5 text-right whitespace-nowrap space-x-2">
                       {site.isPanel ? (
                         <span className="text-xs text-slate-500">Protected</span>
                       ) : site.type === 'dbonly' ? (
@@ -368,17 +413,27 @@ export default function SitesPage() {
                           Via Databases
                         </span>
                       ) : (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setDeleteError(null);
-                            setDeleteTarget(site);
-                          }}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition"
-                        >
-                          <IconTrash className="w-3.5 h-3.5" />
-                          <span>Delete</span>
-                        </button>
+                        <>
+                          {NAME_RE.test(site.name) && (
+                            <Link
+                              href={`/sites/${encodeURIComponent(site.name)}`}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-borderline bg-elevated px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-slate-500 transition"
+                            >
+                              <span>Files &amp; Deploy</span>
+                            </Link>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDeleteError(null);
+                              setDeleteTarget(site);
+                            }}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-2.5 py-1 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition"
+                          >
+                            <IconTrash className="w-3.5 h-3.5" />
+                            <span>Delete</span>
+                          </button>
+                        </>
                       )}
                     </td>
                   </tr>
@@ -392,9 +447,10 @@ export default function SitesPage() {
       {/* Create Site Modal */}
       <Modal
         open={createOpen}
-        title="Create Virtual Host"
-        subtitle="Creates Apache vhost, docroot /var/www/<name>, symlinks /db.php, and reloads Apache."
+        title="Create Web App & Virtual Host"
+        subtitle="Creates Apache vhost, site directory, optional matching SQLite database, and Cloudflare Tunnel route."
         onClose={() => setCreateOpen(false)}
+        maxWidthClass="max-w-xl"
       >
         <form onSubmit={handleCreate} className="space-y-4">
           {createError && (
@@ -421,17 +477,22 @@ export default function SitesPage() {
 
           <div>
             <label className="block text-xs font-medium text-slate-300 mb-1.5">
-              Runtime Type
+              Web App Framework / Type
             </label>
             <select
               value={siteType}
               onChange={(e) => setSiteType(e.target.value as SiteType)}
               className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 text-sm text-slate-100 focus:border-accent focus:outline-none"
             >
-              <option value="static">static — HTML/CSS/JS (disables arbitrary PHP)</option>
-              <option value="php">php — Apache + PHP 8.x docroot</option>
-              <option value="nextjs">nextjs — Reverse proxy + systemd unit template</option>
+              {SITE_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {FRAMEWORK_PRESETS[t].label} — {FRAMEWORK_PRESETS[t].summary}
+                </option>
+              ))}
             </select>
+            <div className="mt-1.5 rounded-md border border-borderline bg-canvas px-3 py-2 text-[11px] font-mono text-slate-400">
+              Auto-build pipeline: <span className="text-slate-200">{selectedPreset.pipeline}</span>
+            </div>
           </div>
 
           <div>
@@ -457,10 +518,10 @@ export default function SitesPage() {
             )}
           </div>
 
-          {siteType === 'nextjs' && (
+          {selectedPreset.hasPort && (
             <div>
               <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                Internal Node Port (optional)
+                Internal App Port (optional)
               </label>
               <input
                 type="number"
@@ -472,10 +533,35 @@ export default function SitesPage() {
                 className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-sm text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
               />
               <p className="mt-1 text-xs text-slate-500">
-                Also creates <span className="font-mono">/etc/systemd/system/app-{name || '<name>'}.service</span>; excludes <span className="font-mono">/db.php</span> from ProxyPass.
+                Creates <span className="font-mono">/etc/systemd/system/app-{name || '<name>'}.service</span> and excludes <span className="font-mono">/db.php</span> from ProxyPass.
               </p>
             </div>
           )}
+
+          <div className="space-y-2.5 rounded-lg border border-borderline bg-canvas p-3">
+            <label className="flex items-start gap-2.5 text-xs text-slate-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={createDb}
+                onChange={(e) => setCreateDb(e.target.checked)}
+                className="mt-0.5 rounded border-borderline bg-surface text-accent focus:ring-accent"
+              />
+              <span>
+                Automatically create matching SQLite database (<span className="font-mono">/srv/db/{name || '<name>'}/data.sqlite</span>) and seed <span className="font-mono">.env</span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2.5 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={enableWatch}
+                onChange={(e) => setEnableWatch(e.target.checked)}
+                className="mt-0.5 rounded border-borderline bg-surface text-accent focus:ring-accent"
+              />
+              <span>
+                Enable filesystem auto-watcher (automatically runs the {selectedPreset.label} build pipeline on SSH/SFTP file changes)
+              </span>
+            </label>
+          </div>
 
           <div className="flex justify-end gap-2 pt-2">
             <button
@@ -490,17 +576,20 @@ export default function SitesPage() {
               disabled={!isFormValid || creating}
               className="rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-accent-hover disabled:opacity-50 transition"
             >
-              {creating ? 'Creating...' : 'Create Site'}
+              {creating ? 'Provisioning...' : 'Create Site'}
             </button>
           </div>
         </form>
       </Modal>
 
+      {/* Reveal-Once Auto-Created Database API Key Modal */}
+      <RevealKeyModal info={provisionedDb} onClose={() => setProvisionedDb(null)} />
+
       {/* Certbot TLS Modal */}
       <Modal
         open={certOpen}
-        title="Provision Let's Encrypt TLS Certificate"
-        subtitle="Runs certbot --apache -d <domain>. DNS A/AAAA record must already point to this server."
+        title="Provision Let's Encrypt Origin TLS Certificate"
+        subtitle="Optional when behind Cloudflare Tunnel (which terminates HTTPS at the edge)."
         onClose={() => setCertOpen(false)}
         maxWidthClass="max-w-xl"
       >

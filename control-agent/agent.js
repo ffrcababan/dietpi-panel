@@ -31,13 +31,27 @@ const AGENT_SECRET = process.env.AGENT_SECRET || '';
 const BASE_DOMAIN = process.env.BASE_DOMAIN || 'localhost';
 const CERTBOT_EMAIL = process.env.CERTBOT_EMAIL || '';
 
-const MAX_REQUEST_BYTES = 64 * 1024;
+const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const CERTBOT_TIMEOUT_MS = 120_000;
+const BUILD_TIMEOUT_MS = 300_000;
+const BUILD_LOG_DIR = '/var/log/dietpi-panel-builds';
+const WATCHERS_FILE = '/etc/control-agent/watchers.json';
 
 const NAME_RE = /^[a-z0-9-]{1,32}$/;
-const SITE_TYPE_SET = new Set(['static', 'php', 'nextjs']);
+const SITE_TYPE_SET = new Set([
+  'static',
+  'php',
+  'laravel',
+  'react',
+  'vue',
+  'astro',
+  'sveltekit',
+  'nextjs',
+  'node',
+  'python',
+]);
 const DOMAIN_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const UNIT_RE = /^[a-zA-Z0-9@_.-]{1,64}$/;
 const RESERVED_NAMES = new Set([
@@ -60,6 +74,14 @@ const MUTATING_ACTIONS = new Set([
   'tunnel.route',
   'tunnel.unroute',
   'tunnel.restart',
+  'files.write',
+  'files.upload',
+  'files.mkdir',
+  'files.rename',
+  'files.delete',
+  'site.git',
+  'site.build',
+  'site.watch',
 ]);
 
 function validateSecretConfigured() {
@@ -99,8 +121,15 @@ function sanitizeParamsForLog(action, params) {
   }
   const copy = {};
   for (const [k, v] of Object.entries(params)) {
-    if (k.toLowerCase().includes('secret') || k.toLowerCase().includes('key') || k.toLowerCase().includes('password')) {
-      copy[k] = '[REDACTED]';
+    const lower = k.toLowerCase();
+    if (
+      lower.includes('secret') ||
+      lower.includes('key') ||
+      lower.includes('password') ||
+      k === 'content' ||
+      k === 'contentBase64'
+    ) {
+      copy[k] = typeof v === 'string' ? `[REDACTED:${v.length}b]` : '[REDACTED]';
     } else if (typeof v === 'string' && v.length > 200) {
       copy[k] = `${v.slice(0, 200)}...`;
     } else {
@@ -679,6 +708,619 @@ function parseJsonSafe(text) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Jailed Site File Manager, Git Deploy, Framework Builds & Recursive Watcher
+// ---------------------------------------------------------------------------
+
+const MAX_READ_BYTES = 1024 * 1024;
+const MAX_WRITE_BYTES = 2 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+const GIT_URL_RE = /^(?:https:\/\/[a-zA-Z0-9._~:/?#@!$&'()*+,;=%-]+|git@[a-zA-Z0-9.-]+:[a-zA-Z0-9._/-]+)$/;
+const GIT_BRANCH_RE = /^[a-zA-Z0-9._/-]{1,64}$/;
+const SAFE_FILENAME_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+
+const WATCH_IGNORED_DIRS = new Set([
+  'node_modules',
+  '.git',
+  'vendor',
+  '.venv',
+  'dist',
+  'build',
+  '.next',
+  '.svelte-kit',
+  '.astro',
+  'storage',
+  '__pycache__',
+  '.cache',
+]);
+
+let cachedWwwDataIds = null;
+function getWwwDataIds() {
+  if (cachedWwwDataIds) return cachedWwwDataIds;
+  try {
+    const passwd = fs.readFileSync('/etc/passwd', 'utf8');
+    for (const line of passwd.split('\n')) {
+      const parts = line.split(':');
+      if (parts[0] === 'www-data' && parts.length >= 4) {
+        const uid = Number.parseInt(parts[2], 10);
+        const gid = Number.parseInt(parts[3], 10);
+        if (Number.isInteger(uid) && Number.isInteger(gid)) {
+          cachedWwwDataIds = { uid, gid };
+          return cachedWwwDataIds;
+        }
+      }
+    }
+  } catch {
+    // non-Linux local test fallback
+  }
+  return { uid: 33, gid: 33 };
+}
+
+function chownPathNoFollow(targetPath, uid, gid) {
+  try {
+    const st = fs.lstatSync(targetPath);
+    if (st.isSymbolicLink()) {
+      if (typeof fs.lchownSync === 'function') fs.lchownSync(targetPath, uid, gid);
+    } else {
+      fs.chownSync(targetPath, uid, gid);
+    }
+  } catch {
+    // ignore missing or unsupported
+  }
+}
+
+function chownRecursiveSafe(targetPath, uid, gid) {
+  chownPathNoFollow(targetPath, uid, gid);
+  try {
+    const st = fs.lstatSync(targetPath);
+    if (!st.isDirectory()) return;
+    for (const entry of fs.readdirSync(targetPath, { withFileTypes: true })) {
+      const child = path.join(targetPath, entry.name);
+      if (entry.isDirectory()) {
+        chownRecursiveSafe(child, uid, gid);
+      } else {
+        chownPathNoFollow(child, uid, gid);
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function resolveJailedPath(name, rawRelPath = '', opts = {}) {
+  const { allowRoot = false, allowMissingLeaf = false, protectDbPhp = true } = opts;
+  const siteName = validateName(name, 'site name');
+  const baseDir = `/var/www/${siteName}`;
+  if (!fs.existsSync(baseDir)) {
+    throw new Error(`Site root directory does not exist: ${baseDir}`);
+  }
+  const siteRoot = fs.realpathSync(baseDir);
+
+  if (rawRelPath !== undefined && rawRelPath !== null && typeof rawRelPath !== 'string') {
+    throw new Error('Path must be a string');
+  }
+  const normalizedInput = String(rawRelPath || '').replace(/\\/g, '/').trim();
+  if (normalizedInput.includes('\0')) {
+    throw new Error('Invalid null byte in path');
+  }
+  if (normalizedInput.startsWith('/')) {
+    throw new Error('Absolute paths are not permitted');
+  }
+
+  const parts = normalizedInput.split('/').filter((s) => s !== '' && s !== '.');
+  for (const part of parts) {
+    if (part === '..') {
+      throw new Error('Path traversal ("..") is not permitted');
+    }
+  }
+
+  const relPath = parts.join('/');
+  if (!relPath) {
+    if (!allowRoot) {
+      throw new Error('A relative file or folder path is required');
+    }
+    return { siteRoot, targetPath: siteRoot, relPath: '' };
+  }
+
+  if (protectDbPhp && relPath === 'db.php') {
+    throw new Error('The shared db.php endpoint symlink is managed by DietPi Panel');
+  }
+
+  const candidate = path.resolve(siteRoot, relPath);
+  const ensureInside = (resolved) => {
+    if (resolved !== siteRoot && !resolved.startsWith(`${siteRoot}${path.sep}`)) {
+      throw new Error('Resolved path escapes site directory');
+    }
+  };
+
+  if (fs.existsSync(candidate)) {
+    const resolved = fs.realpathSync(candidate);
+    ensureInside(resolved);
+    return { siteRoot, targetPath: resolved, relPath };
+  }
+
+  if (!allowMissingLeaf) {
+    throw new Error(`Path not found: ${relPath}`);
+  }
+
+  // Walk upward to the deepest existing parent to verify no symlink escapes the jail
+  let cursor = path.dirname(candidate);
+  while (!fs.existsSync(cursor)) {
+    const next = path.dirname(cursor);
+    if (next === cursor) break;
+    cursor = next;
+  }
+  const resolvedAncestor = fs.realpathSync(cursor);
+  ensureInside(resolvedAncestor);
+
+  const tail = path.relative(cursor, candidate);
+  const finalTarget = path.join(resolvedAncestor, tail);
+  ensureInside(finalTarget);
+  return { siteRoot, targetPath: finalTarget, relPath };
+}
+
+function getSiteTypeFromVhost(name) {
+  const vhostPath = `/etc/apache2/sites-available/${name}.conf`;
+  if (!fs.existsSync(vhostPath)) return 'custom';
+  const content = fs.readFileSync(vhostPath, 'utf8');
+  const m = content.match(/^#\s*dietpi-panel:type=([a-z0-9-]+)/m);
+  return m ? m[1].trim() : 'custom';
+}
+
+function seedFrameworkEnv(name, type, domain, port, dbInfo) {
+  if (!dbInfo || !dbInfo.dbPath || !dbInfo.apiKey) return null;
+  const siteRoot = `/var/www/${name}`;
+  if (!fs.existsSync(siteRoot)) return null;
+
+  const envFileName = type === 'nextjs' ? '.env.local' : '.env';
+  const envPath = path.join(siteRoot, envFileName);
+  if (fs.existsSync(envPath)) return null;
+
+  if (type === 'static' || type === 'php') {
+    return null;
+  }
+
+  const lines = [];
+  if (type === 'laravel') {
+    lines.push(
+      `APP_NAME=${name}`,
+      'APP_ENV=production',
+      `APP_URL=https://${domain}`,
+      'DB_CONNECTION=sqlite',
+      `DB_DATABASE=${dbInfo.dbPath}`,
+      `PANEL_DB_ENDPOINT=https://${domain}/db.php`,
+      `PANEL_DB_API_KEY=${dbInfo.apiKey}`
+    );
+  } else {
+    if (port) lines.push(`PORT=${port}`);
+    lines.push(
+      `DB_PATH=${dbInfo.dbPath}`,
+      `DB_ENDPOINT=https://${domain}/db.php`,
+      `DB_API_KEY=${dbInfo.apiKey}`
+    );
+  }
+
+  fs.writeFileSync(envPath, `${lines.join('\n')}\n`, { mode: 0o640 });
+  const { uid, gid } = getWwwDataIds();
+  chownPathNoFollow(envPath, uid, gid);
+  return envFileName;
+}
+
+function findExecutable(candidates) {
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv = {}) {
+  const { uid, gid } = getWwwDataIds();
+  const cacheDirs = [
+    '/tmp/npm-cache-www-data',
+    '/tmp/composer-www-data',
+    '/tmp/pip-cache-www-data',
+  ];
+  for (const dir of cacheDirs) {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
+    }
+    chownPathNoFollow(dir, uid, gid);
+  }
+
+  const start = Date.now();
+  try {
+    const { stdout, stderr } = await execFileAsync(bin, args, {
+      cwd,
+      uid,
+      gid,
+      shell: false,
+      timeout,
+      maxBuffer: 4 * 1024 * 1024,
+      env: {
+        PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        HOME: '/tmp',
+        NPM_CONFIG_CACHE: '/tmp/npm-cache-www-data',
+        COMPOSER_HOME: '/tmp/composer-www-data',
+        PIP_CACHE_DIR: '/tmp/pip-cache-www-data',
+        GIT_TERMINAL_PROMPT: '0',
+        ...extraEnv,
+      },
+    });
+    return {
+      cmd: `${path.basename(bin)} ${args.join(' ')}`.trim(),
+      ok: true,
+      stdout: (stdout || '').slice(-8000),
+      stderr: (stderr || '').slice(-4000),
+      durationMs: Date.now() - start,
+    };
+  } catch (err) {
+    return {
+      cmd: `${path.basename(bin)} ${args.join(' ')}`.trim(),
+      ok: false,
+      stdout: (typeof err.stdout === 'string' ? err.stdout : '').slice(-8000),
+      stderr: (typeof err.stderr === 'string' && err.stderr ? err.stderr : err.message).slice(-4000),
+      durationMs: Date.now() - start,
+    };
+  }
+}
+
+function readPackageScripts(siteRoot) {
+  const pkgPath = path.join(siteRoot, 'package.json');
+  if (!fs.existsSync(pkgPath)) return null;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    return pkg && typeof pkg.scripts === 'object' ? pkg.scripts : {};
+  } catch {
+    return {};
+  }
+}
+
+function readBuildStatus(name) {
+  const statusFile = path.join(BUILD_LOG_DIR, `${name}.json`);
+  if (!fs.existsSync(statusFile)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeBuildStatus(name, record) {
+  if (!fs.existsSync(BUILD_LOG_DIR)) {
+    fs.mkdirSync(BUILD_LOG_DIR, { recursive: true, mode: 0o750 });
+  }
+  const statusFile = path.join(BUILD_LOG_DIR, `${name}.json`);
+  fs.writeFileSync(statusFile, JSON.stringify(record, null, 2), { mode: 0o640 });
+}
+
+const activeBuilds = new Set();
+const pendingBuildTriggers = new Map();
+const lastBuildCompleteAt = new Map();
+
+async function executeSiteBuildOnce(name, trigger = 'manual') {
+  const siteRoot = fs.realpathSync(`/var/www/${name}`);
+  const type = getSiteTypeFromVhost(name);
+  const startedAt = new Date().toISOString();
+  const steps = [];
+  let allOk = true;
+
+  const npmBin = findExecutable(['/usr/bin/npm', '/usr/local/bin/npm']) || 'npm';
+  const phpBin = findExecutable(['/usr/bin/php', '/usr/local/bin/php']) || 'php';
+  const composerBin = findExecutable(['/usr/local/bin/composer', '/usr/bin/composer']);
+  const pythonBin = findExecutable(['/usr/bin/python3', '/usr/local/bin/python3']) || 'python3';
+
+  const runStep = async (bin, args, extraEnv = {}) => {
+    const step = await runAsWwwData(bin, args, siteRoot, BUILD_TIMEOUT_MS, extraEnv);
+    steps.push(step);
+    if (!step.ok) allOk = false;
+    return step.ok;
+  };
+
+  if (type === 'static' || type === 'dbonly') {
+    steps.push({
+      cmd: 'noop (static)',
+      ok: true,
+      stdout: 'Static site requires no build step.',
+      stderr: '',
+      durationMs: 0,
+    });
+  } else if (type === 'php') {
+    if (fs.existsSync(path.join(siteRoot, 'index.php'))) {
+      await runStep(phpBin, ['-l', 'index.php']);
+    } else {
+      steps.push({
+        cmd: 'php -l',
+        ok: true,
+        stdout: 'No index.php found; skipping syntax check.',
+        stderr: '',
+        durationMs: 0,
+      });
+    }
+  } else if (type === 'laravel') {
+    if (fs.existsSync(path.join(siteRoot, 'composer.json'))) {
+      if (!composerBin) {
+        steps.push({
+          cmd: 'composer install',
+          ok: false,
+          stdout: '',
+          stderr: 'composer is not installed on the server (apt install composer)',
+          durationMs: 0,
+        });
+        allOk = false;
+      } else {
+        await runStep(composerBin, [
+          'install',
+          '--no-dev',
+          '--optimize-autoloader',
+          '--no-interaction',
+        ]);
+      }
+    }
+    const scripts = readPackageScripts(siteRoot);
+    if (allOk && scripts && typeof scripts.build === 'string') {
+      const installCmd = fs.existsSync(path.join(siteRoot, 'package-lock.json')) ? 'ci' : 'install';
+      if (await runStep(npmBin, [installCmd])) {
+        await runStep(npmBin, ['run', 'build']);
+      }
+    }
+    if (allOk && fs.existsSync(path.join(siteRoot, 'artisan'))) {
+      if (await runStep(phpBin, ['artisan', 'migrate', '--force'])) {
+        await runStep(phpBin, ['artisan', 'config:cache']);
+        await runStep(phpBin, ['artisan', 'route:cache']);
+        await runStep(phpBin, ['artisan', 'view:cache']);
+      }
+    }
+  } else if (type === 'react' || type === 'vue' || type === 'astro' || type === 'sveltekit') {
+    const scripts = readPackageScripts(siteRoot);
+    if (!scripts) {
+      steps.push({
+        cmd: 'npm run build',
+        ok: true,
+        stdout: 'No package.json present yet; skipping build.',
+        stderr: '',
+        durationMs: 0,
+      });
+    } else {
+      const installCmd = fs.existsSync(path.join(siteRoot, 'package-lock.json')) ? 'ci' : 'install';
+      if (await runStep(npmBin, [installCmd])) {
+        if (typeof scripts.build === 'string') {
+          await runStep(npmBin, ['run', 'build']);
+        }
+      }
+    }
+  } else if (type === 'nextjs' || type === 'node') {
+    const scripts = readPackageScripts(siteRoot);
+    if (!scripts) {
+      steps.push({
+        cmd: 'npm install',
+        ok: true,
+        stdout: 'No package.json present yet; skipping build.',
+        stderr: '',
+        durationMs: 0,
+      });
+    } else {
+      const installCmd = fs.existsSync(path.join(siteRoot, 'package-lock.json')) ? 'ci' : 'install';
+      if (await runStep(npmBin, [installCmd], { NODE_ENV: 'development' })) {
+        if (typeof scripts.build === 'string') {
+          await runStep(npmBin, ['run', 'build'], { NODE_ENV: 'production' });
+        }
+      }
+    }
+    if (allOk && fs.existsSync(`/etc/systemd/system/app-${name}.service`) && scripts) {
+      const t0 = Date.now();
+      await runBin('systemctl', ['enable', `app-${name}.service`]);
+      const rst = await runBin('systemctl', ['restart', `app-${name}.service`]);
+      steps.push({
+        cmd: `systemctl restart app-${name}.service`,
+        ok: rst.ok,
+        stdout: rst.ok ? `Restarted app-${name}.service` : rst.stdout,
+        stderr: rst.stderr,
+        durationMs: Date.now() - t0,
+      });
+      if (!rst.ok) allOk = false;
+    }
+  } else if (type === 'python') {
+    const venvDir = path.join(siteRoot, '.venv');
+    if (!fs.existsSync(venvDir)) {
+      await runStep(pythonBin, ['-m', 'venv', '.venv']);
+    }
+    const pipBin = path.join(venvDir, 'bin', 'pip');
+    if (allOk && fs.existsSync(path.join(siteRoot, 'requirements.txt')) && fs.existsSync(pipBin)) {
+      await runStep(pipBin, ['install', '-r', 'requirements.txt']);
+    }
+    if (
+      allOk &&
+      fs.existsSync(`/etc/systemd/system/app-${name}.service`) &&
+      fs.existsSync(path.join(siteRoot, 'app.py'))
+    ) {
+      const t0 = Date.now();
+      await runBin('systemctl', ['enable', `app-${name}.service`]);
+      const rst = await runBin('systemctl', ['restart', `app-${name}.service`]);
+      steps.push({
+        cmd: `systemctl restart app-${name}.service`,
+        ok: rst.ok,
+        stdout: rst.ok ? `Restarted app-${name}.service` : rst.stdout,
+        stderr: rst.stderr,
+        durationMs: Date.now() - t0,
+      });
+      if (!rst.ok) allOk = false;
+    }
+  }
+
+  const record = {
+    name,
+    type,
+    trigger,
+    ok: allOk,
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    steps,
+  };
+  writeBuildStatus(name, record);
+  lastBuildCompleteAt.set(name, Date.now());
+  return record;
+}
+
+async function runSiteBuild(name, trigger = 'manual') {
+  validateName(name, 'site name');
+  if (!fs.existsSync(`/var/www/${name}`)) {
+    throw new Error(`Site "${name}" directory does not exist`);
+  }
+  if (activeBuilds.has(name)) {
+    pendingBuildTriggers.set(name, trigger);
+    return { queued: true, name, trigger };
+  }
+
+  activeBuilds.add(name);
+  let lastRecord;
+  try {
+    lastRecord = await executeSiteBuildOnce(name, trigger);
+    while (pendingBuildTriggers.has(name)) {
+      const nextTrigger = pendingBuildTriggers.get(name);
+      pendingBuildTriggers.delete(name);
+      lastRecord = await executeSiteBuildOnce(name, nextTrigger);
+    }
+  } finally {
+    activeBuilds.delete(name);
+  }
+  appendAuditLog('site.build', { name, trigger, type: lastRecord?.type }, Boolean(lastRecord?.ok));
+  return lastRecord;
+}
+
+// Per-directory inotify watcher (works on all Node 20+ Linux versions without recursive: true)
+const activeWatchers = new Map(); // name -> { watchers: Map<dir, FSWatcher>, timer: NodeJS.Timeout | null }
+
+function loadPersistedWatchers() {
+  try {
+    if (!fs.existsSync(WATCHERS_FILE)) return [];
+    const parsed = JSON.parse(fs.readFileSync(WATCHERS_FILE, 'utf8'));
+    return Array.isArray(parsed) ? parsed.filter((n) => NAME_RE.test(String(n))) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePersistedWatchers(names) {
+  const dir = path.dirname(WATCHERS_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
+  }
+  fs.writeFileSync(WATCHERS_FILE, JSON.stringify(Array.from(new Set(names)).sort()), { mode: 0o640 });
+}
+
+function isSiteWatcherEnabled(name) {
+  return activeWatchers.has(name);
+}
+
+function disableSiteWatcher(name, persist = true) {
+  const state = activeWatchers.get(name);
+  if (state) {
+    if (state.timer) clearTimeout(state.timer);
+    for (const w of state.watchers.values()) {
+      try {
+        w.close();
+      } catch {
+        // ignore
+      }
+    }
+    activeWatchers.delete(name);
+  }
+  if (persist) {
+    const remaining = loadPersistedWatchers().filter((n) => n !== name);
+    savePersistedWatchers(remaining);
+  }
+}
+
+function enableSiteWatcher(name, persist = true) {
+  validateName(name, 'site name');
+  const rootDir = `/var/www/${name}`;
+  if (!fs.existsSync(rootDir)) {
+    throw new Error(`Site root does not exist: ${rootDir}`);
+  }
+  const siteRoot = fs.realpathSync(rootDir);
+  if (activeWatchers.has(name)) {
+    return { enabled: true, watchedDirs: activeWatchers.get(name).watchers.size };
+  }
+
+  const state = { watchers: new Map(), timer: null };
+
+  const triggerDebounced = () => {
+    const lastDone = lastBuildCompleteAt.get(name) || 0;
+    if (Date.now() - lastDone < 3000 || activeBuilds.has(name)) {
+      return;
+    }
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      runSiteBuild(name, 'watcher').catch((err) => {
+        appendAuditLog('site.build', { name, trigger: 'watcher' }, false, err.message);
+      });
+    }, 1500);
+  };
+
+  const attachDir = (dirPath) => {
+    if (state.watchers.has(dirPath) || state.watchers.size >= 300) return;
+    const base = path.basename(dirPath);
+    if (dirPath !== siteRoot && WATCH_IGNORED_DIRS.has(base)) return;
+
+    try {
+      const w = fs.watch(dirPath, (eventType, filename) => {
+        if (filename) {
+          const fname = String(filename);
+          if (WATCH_IGNORED_DIRS.has(fname) || /\.(log|tmp|swp)$/i.test(fname)) {
+            return;
+          }
+          const full = path.join(dirPath, fname);
+          try {
+            if (fs.existsSync(full) && fs.lstatSync(full).isDirectory()) {
+              attachDir(full);
+            }
+          } catch {
+            // ignore transient race
+          }
+        }
+        triggerDebounced();
+      });
+      w.on('error', () => {
+        state.watchers.delete(dirPath);
+      });
+      state.watchers.set(dirPath, w);
+
+      for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+        if (!entry.isDirectory() || WATCH_IGNORED_DIRS.has(entry.name)) continue;
+        attachDir(path.join(dirPath, entry.name));
+      }
+    } catch {
+      // ignore unreadable subdir
+    }
+  };
+
+  attachDir(siteRoot);
+  activeWatchers.set(name, state);
+
+  if (persist) {
+    const existing = loadPersistedWatchers();
+    if (!existing.includes(name)) {
+      existing.push(name);
+      savePersistedWatchers(existing);
+    }
+  }
+  return { enabled: true, watchedDirs: state.watchers.size };
+}
+
+function startPersistedWatchers() {
+  for (const name of loadPersistedWatchers()) {
+    if (fs.existsSync(`/var/www/${name}`)) {
+      try {
+        enableSiteWatcher(name, false);
+      } catch {
+        // skip invalid
+      }
+    }
+  }
+}
+
+
 async function handleAction(action, params = {}, socket = null) {
   if (params === null || typeof params !== 'object' || Array.isArray(params)) {
     throw new Error('params must be an object');
@@ -778,18 +1420,22 @@ async function handleAction(action, params = {}, socket = null) {
     case 'site.create': {
       const name = validateName(params.name, 'site name');
       if (typeof params.type !== 'string' || !SITE_TYPE_SET.has(params.type)) {
-        throw new Error('Invalid site type: must be static, php, or nextjs');
+        throw new Error(
+          'Invalid site type: must be static, php, laravel, react, vue, astro, sveltekit, nextjs, node, or python'
+        );
       }
       const type = params.type;
       const domain = params.domain ? validateDomain(params.domain) : '';
+      const createDb = params.createDb !== false;
+      const enableWatch = Boolean(params.watch);
       let portStr = '';
       if (params.port !== undefined && params.port !== null && params.port !== '') {
         const portNum = Number(params.port);
         if (!Number.isInteger(portNum) || portNum < 3001 || portNum > 39999) {
           throw new Error('Invalid port: must be integer between 3001 and 39999');
         }
-        if (type !== 'nextjs') {
-          throw new Error('Port option is only valid for nextjs sites');
+        if (type !== 'nextjs' && type !== 'node' && type !== 'python') {
+          throw new Error('Port option is only valid for nextjs, node, or python sites');
         }
         portStr = String(portNum);
       }
@@ -798,24 +1444,78 @@ async function handleAction(action, params = {}, socket = null) {
       if (!res.ok) {
         return { ok: false, stdout: res.stdout.trim(), stderr: res.stderr };
       }
-      const created = parseJsonSafe(res.stdout.trim());
-      if (!created || !created.domain) {
-        return { ok: true, stdout: res.stdout.trim(), stderr: res.stderr };
+      const created = parseJsonSafe(res.stdout.trim()) || { name, type, domain };
+
+      let database = null;
+      let existingDb = false;
+      let envFile = null;
+      let dbError = null;
+      const dbPath = `/srv/db/${name}/data.sqlite`;
+
+      if (fs.existsSync(dbPath)) {
+        existingDb = true;
+      } else if (createDb) {
+        const dbRes = await runBin('/usr/local/bin/mkdb', [name]);
+        if (dbRes.ok) {
+          database = parseJsonSafe(dbRes.stdout.trim());
+          if (database) {
+            try {
+              envFile = seedFrameworkEnv(
+                name,
+                type,
+                created.domain || database.domain,
+                created.port,
+                database
+              );
+            } catch (envErr) {
+              dbError = `Created DB, failed to seed env file: ${envErr.message}`;
+            }
+          }
+        } else {
+          dbError = dbRes.stderr || 'Automatic database creation failed';
+        }
       }
-      const tunnel = await tunnelAddHostname(created.domain);
-      return { ok: true, stdout: attachTunnelResult(res.stdout.trim(), tunnel), stderr: res.stderr };
+
+      if (enableWatch) {
+        try {
+          enableSiteWatcher(name, true);
+        } catch {
+          // ignore watcher setup failure
+        }
+      }
+
+      const tunnel = created.domain ? await tunnelAddHostname(created.domain) : undefined;
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          ...created,
+          database,
+          existingDb,
+          envFile,
+          dbError,
+          watch: isSiteWatcherEnabled(name),
+          tunnel,
+        }),
+        stderr: res.stderr,
+      };
     }
 
     case 'site.list': {
       const res = await runBin('/usr/local/bin/listsites', []);
       const raw = res.stdout.trim() || '[]';
-      const hostSet = res.ok ? getTunnelHostnameSet() : null;
-      const sites = hostSet ? parseJsonSafe(raw) : null;
-      if (!Array.isArray(sites)) {
-        return { ok: res.ok, stdout: raw, stderr: res.stderr };
+      if (!res.ok) {
+        return { ok: false, stdout: raw, stderr: res.stderr };
       }
+      const sites = parseJsonSafe(raw);
+      if (!Array.isArray(sites)) {
+        return { ok: true, stdout: raw, stderr: res.stderr };
+      }
+      const hostSet = getTunnelHostnameSet();
       for (const site of sites) {
-        site.tunnel = hostSet.has(String(site.serverName || '').toLowerCase());
+        if (hostSet) {
+          site.tunnel = hostSet.has(String(site.serverName || '').toLowerCase());
+        }
+        site.watch = isSiteWatcherEnabled(String(site.name || ''));
       }
       return { ok: true, stdout: JSON.stringify(sites), stderr: res.stderr };
     }
@@ -830,6 +1530,8 @@ async function handleAction(action, params = {}, socket = null) {
       if (!fs.existsSync(vhostPath) && !fs.existsSync(docroot)) {
         throw new Error(`Site "${name}" does not exist`);
       }
+
+      disableSiteWatcher(name, true);
 
       const siteDomain = readVhostServerName(vhostPath);
       const archiveBase = '/srv/backups/sites';
@@ -1120,6 +1822,409 @@ async function handleAction(action, params = {}, socket = null) {
       return { ok: true, stdout: JSON.stringify(entries), stderr: '' };
     }
 
+    case 'files.list': {
+      const { siteRoot, targetPath, relPath } = resolveJailedPath(
+        params.name,
+        params.path || '',
+        { allowRoot: true, protectDbPhp: false }
+      );
+      const st = fs.lstatSync(targetPath);
+      if (!st.isDirectory()) {
+        throw new Error('Target path is not a directory');
+      }
+      const entries = [];
+      for (const dirent of fs.readdirSync(targetPath, { withFileTypes: true })) {
+        const full = path.join(targetPath, dirent.name);
+        let lst;
+        try {
+          lst = fs.lstatSync(full);
+        } catch {
+          continue;
+        }
+        let type = 'file';
+        if (lst.isDirectory()) type = 'dir';
+        else if (lst.isSymbolicLink()) type = 'symlink';
+        entries.push({
+          name: dirent.name,
+          path: relPath ? `${relPath}/${dirent.name}` : dirent.name,
+          type,
+          size: lst.size,
+          modified: lst.mtime.toISOString(),
+        });
+      }
+      entries.sort((a, b) => {
+        if (a.type === 'dir' && b.type !== 'dir') return -1;
+        if (a.type !== 'dir' && b.type === 'dir') return 1;
+        return a.name.localeCompare(b.name);
+      });
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          siteRoot,
+          path: relPath,
+          entries,
+        }),
+        stderr: '',
+      };
+    }
+
+    case 'files.read': {
+      const { targetPath, relPath } = resolveJailedPath(params.name, params.path, {
+        allowRoot: false,
+        protectDbPhp: false,
+      });
+      const st = fs.lstatSync(targetPath);
+      if (st.isDirectory()) {
+        throw new Error('Cannot read a directory as a file');
+      }
+      if (st.size > MAX_READ_BYTES) {
+        throw new Error(`File exceeds ${MAX_READ_BYTES} byte read limit (${st.size} bytes)`);
+      }
+      const buf = fs.readFileSync(targetPath);
+      const binary = buf.includes(0);
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          path: relPath,
+          size: st.size,
+          binary,
+          content: binary ? '' : buf.toString('utf8'),
+        }),
+        stderr: '',
+      };
+    }
+
+    case 'files.write': {
+      if (typeof params.content !== 'string') {
+        throw new Error('File content must be a string');
+      }
+      const contentBytes = Buffer.byteLength(params.content, 'utf8');
+      if (contentBytes > MAX_WRITE_BYTES) {
+        throw new Error(`File content exceeds ${MAX_WRITE_BYTES} byte limit`);
+      }
+      const name = validateName(params.name, 'site name');
+      const { siteRoot, targetPath, relPath } = resolveJailedPath(name, params.path, {
+        allowRoot: false,
+        allowMissingLeaf: true,
+        protectDbPhp: true,
+      });
+      const parentDir = path.dirname(targetPath);
+      if (!fs.existsSync(parentDir)) {
+        fs.mkdirSync(parentDir, { recursive: true, mode: 0o755 });
+      }
+      const isEnv = path.basename(targetPath).startsWith('.env');
+      fs.writeFileSync(targetPath, params.content, { mode: isEnv ? 0o640 : 0o644 });
+      const { uid, gid } = getWwwDataIds();
+      let dirCursor = parentDir;
+      while (dirCursor !== siteRoot && dirCursor.startsWith(`${siteRoot}${path.sep}`)) {
+        chownPathNoFollow(dirCursor, uid, gid);
+        dirCursor = path.dirname(dirCursor);
+      }
+      chownPathNoFollow(targetPath, uid, gid);
+
+      const triggerBuild = params.triggerBuild !== false;
+      const build = triggerBuild ? await runSiteBuild(name, 'file-edit') : null;
+      return {
+        ok: true,
+        stdout: JSON.stringify({ path: relPath, size: contentBytes, build }),
+        stderr: '',
+      };
+    }
+
+    case 'files.upload': {
+      const name = validateName(params.name, 'site name');
+      const filename = typeof params.filename === 'string' ? params.filename.trim() : '';
+      if (!SAFE_FILENAME_RE.test(filename) || filename === '.' || filename === '..') {
+        throw new Error('Invalid filename: use 1-128 characters [a-zA-Z0-9._-]');
+      }
+      if (typeof params.contentBase64 !== 'string') {
+        throw new Error('contentBase64 must be a string');
+      }
+      const buf = Buffer.from(params.contentBase64, 'base64');
+      if (buf.length > MAX_UPLOAD_BYTES) {
+        throw new Error(`Upload exceeds ${MAX_UPLOAD_BYTES} byte limit`);
+      }
+
+      const relTarget = params.dir ? `${String(params.dir).replace(/\/+$/, '')}/${filename}` : filename;
+      const { siteRoot, targetPath, relPath } = resolveJailedPath(name, relTarget, {
+        allowRoot: false,
+        allowMissingLeaf: true,
+        protectDbPhp: true,
+      });
+      const parentDir = path.dirname(targetPath);
+      fs.mkdirSync(parentDir, { recursive: true, mode: 0o755 });
+
+      const { uid, gid } = getWwwDataIds();
+      let extractedFiles = 0;
+
+      if (Boolean(params.extractZip) && filename.toLowerCase().endsWith('.zip')) {
+        const unzipBin = findExecutable(['/usr/bin/unzip', '/usr/local/bin/unzip']);
+        if (!unzipBin) {
+          throw new Error('unzip is not installed on the server (apt install unzip)');
+        }
+        const stageDir = fs.mkdtempSync('/tmp/dp-unzip-');
+        const zipTmp = path.join(stageDir, 'upload.zip');
+        const extractDir = path.join(stageDir, 'out');
+        fs.mkdirSync(extractDir, { mode: 0o755 });
+        try {
+          fs.writeFileSync(zipTmp, buf, { mode: 0o600 });
+          await execFileAsync(unzipBin, ['-q', '-o', zipTmp, '-d', extractDir], {
+            shell: false,
+            timeout: 60_000,
+          });
+          // Walk staged files safely, blocking symlinks and protecting siteRoot/db.php
+          const copySafe = (srcDir, destDir) => {
+            for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+              const s = path.join(srcDir, entry.name);
+              const d = path.join(destDir, entry.name);
+              const lst = fs.lstatSync(s);
+              if (lst.isSymbolicLink()) {
+                throw new Error(`Zip archive contains forbidden symlink: ${entry.name}`);
+              }
+              if (destDir === siteRoot && entry.name === 'db.php') {
+                continue;
+              }
+              if (lst.isDirectory()) {
+                fs.mkdirSync(d, { recursive: true, mode: 0o755 });
+                chownPathNoFollow(d, uid, gid);
+                copySafe(s, d);
+              } else {
+                fs.copyFileSync(s, d);
+                fs.chmodSync(d, entry.name.startsWith('.env') ? 0o640 : 0o644);
+                chownPathNoFollow(d, uid, gid);
+                extractedFiles += 1;
+              }
+            }
+          };
+          copySafe(extractDir, parentDir);
+        } finally {
+          fs.rmSync(stageDir, { recursive: true, force: true });
+        }
+      } else {
+        fs.writeFileSync(targetPath, buf, {
+          mode: filename.startsWith('.env') ? 0o640 : 0o644,
+        });
+        chownPathNoFollow(targetPath, uid, gid);
+      }
+
+      const triggerBuild = params.triggerBuild !== false;
+      const build = triggerBuild ? await runSiteBuild(name, 'upload') : null;
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          path: relPath,
+          bytes: buf.length,
+          extractedFiles,
+          build,
+        }),
+        stderr: '',
+      };
+    }
+
+    case 'files.mkdir': {
+      const name = validateName(params.name, 'site name');
+      const { targetPath, relPath } = resolveJailedPath(name, params.path, {
+        allowRoot: false,
+        allowMissingLeaf: true,
+        protectDbPhp: true,
+      });
+      fs.mkdirSync(targetPath, { recursive: true, mode: 0o755 });
+      const { uid, gid } = getWwwDataIds();
+      chownRecursiveSafe(targetPath, uid, gid);
+      return { ok: true, stdout: JSON.stringify({ path: relPath }), stderr: '' };
+    }
+
+    case 'files.rename': {
+      const name = validateName(params.name, 'site name');
+      const fromRes = resolveJailedPath(name, params.fromPath, {
+        allowRoot: false,
+        protectDbPhp: true,
+      });
+      const toRes = resolveJailedPath(name, params.toPath, {
+        allowRoot: false,
+        allowMissingLeaf: true,
+        protectDbPhp: true,
+      });
+      if (fs.existsSync(toRes.targetPath)) {
+        throw new Error(`Destination already exists: ${toRes.relPath}`);
+      }
+      fs.mkdirSync(path.dirname(toRes.targetPath), { recursive: true, mode: 0o755 });
+      movePathSafe(fromRes.targetPath, toRes.targetPath);
+      const { uid, gid } = getWwwDataIds();
+      chownRecursiveSafe(toRes.targetPath, uid, gid);
+      return {
+        ok: true,
+        stdout: JSON.stringify({ fromPath: fromRes.relPath, toPath: toRes.relPath }),
+        stderr: '',
+      };
+    }
+
+    case 'files.delete': {
+      const name = validateName(params.name, 'site name');
+      const { targetPath, relPath } = resolveJailedPath(name, params.path, {
+        allowRoot: false,
+        protectDbPhp: true,
+      });
+      fs.rmSync(targetPath, { recursive: true, force: true });
+      return { ok: true, stdout: JSON.stringify({ deleted: relPath }), stderr: '' };
+    }
+
+    case 'site.git': {
+      const name = validateName(params.name, 'site name');
+      const siteRoot = fs.realpathSync(`/var/www/${name}`);
+      const gitBin = findExecutable(['/usr/bin/git', '/usr/local/bin/git']);
+      if (!gitBin) {
+        throw new Error('git is not installed on the server (apt install git)');
+      }
+
+      const gitAction = typeof params.action === 'string' ? params.action : 'status';
+      const hasGit = fs.existsSync(path.join(siteRoot, '.git'));
+
+      if (gitAction === 'status') {
+        if (!hasGit) {
+          return {
+            ok: true,
+            stdout: JSON.stringify({ initialized: false, remote: '', branch: '', status: '' }),
+            stderr: '',
+          };
+        }
+        const [remRes, brRes, stRes] = await Promise.all([
+          runAsWwwData(gitBin, ['-C', siteRoot, 'remote', 'get-url', 'origin'], siteRoot, 15_000),
+          runAsWwwData(gitBin, ['-C', siteRoot, 'rev-parse', '--abbrev-ref', 'HEAD'], siteRoot, 15_000),
+          runAsWwwData(gitBin, ['-C', siteRoot, 'status', '--short'], siteRoot, 15_000),
+        ]);
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            initialized: true,
+            remote: remRes.ok ? remRes.stdout.trim() : '',
+            branch: brRes.ok ? brRes.stdout.trim() : '',
+            status: stRes.stdout.trim(),
+          }),
+          stderr: '',
+        };
+      }
+
+      const branch =
+        typeof params.branch === 'string' && params.branch.trim()
+          ? params.branch.trim()
+          : '';
+      if (branch && (branch.startsWith('-') || !GIT_BRANCH_RE.test(branch))) {
+        throw new Error('Invalid git branch name');
+      }
+      const triggerBuild = params.triggerBuild !== false;
+
+      if (gitAction === 'clone') {
+        const repoUrl = typeof params.repoUrl === 'string' ? params.repoUrl.trim() : '';
+        if (!repoUrl || repoUrl.startsWith('-') || !GIT_URL_RE.test(repoUrl)) {
+          throw new Error('Invalid repository URL (use https://... or git@...)');
+        }
+        if (hasGit) {
+          throw new Error('Repository already initialized; use git pull instead');
+        }
+
+        const stageDir = fs.mkdtempSync('/tmp/dp-clone-');
+        const { uid, gid } = getWwwDataIds();
+        chownPathNoFollow(stageDir, uid, gid);
+        try {
+          const cloneArgs = ['clone', '--depth', '1'];
+          if (branch) cloneArgs.push('--branch', branch);
+          cloneArgs.push('--', repoUrl, path.join(stageDir, 'repo'));
+
+          const cloneStep = await runAsWwwData(gitBin, cloneArgs, stageDir, BUILD_TIMEOUT_MS);
+          if (!cloneStep.ok) {
+            return { ok: false, stdout: '', stderr: cloneStep.stderr || 'git clone failed' };
+          }
+
+          // Merge cloned repository into siteRoot while preserving .env* and db.php symlink
+          const repoDir = path.join(stageDir, 'repo');
+          for (const entry of fs.readdirSync(repoDir, { withFileTypes: true })) {
+            if (entry.name === 'db.php' || entry.name === '.env' || entry.name === '.env.local') {
+              continue;
+            }
+            const src = path.join(repoDir, entry.name);
+            const dest = path.join(siteRoot, entry.name);
+            if (fs.existsSync(dest)) {
+              fs.rmSync(dest, { recursive: true, force: true });
+            }
+            movePathSafe(src, dest);
+          }
+          chownRecursiveSafe(siteRoot, uid, gid);
+        } finally {
+          fs.rmSync(stageDir, { recursive: true, force: true });
+        }
+
+        const build = triggerBuild ? await runSiteBuild(name, 'git-clone') : null;
+        return {
+          ok: true,
+          stdout: JSON.stringify({ cloned: true, repoUrl, branch: branch || 'default', build }),
+          stderr: '',
+        };
+      }
+
+      if (gitAction === 'pull') {
+        if (!hasGit) {
+          throw new Error('No git repository found in this site; clone a repository first');
+        }
+        const pullArgs = ['-C', siteRoot, 'pull', '--ff-only'];
+        if (branch) pullArgs.push('origin', branch);
+        const pullStep = await runAsWwwData(gitBin, pullArgs, siteRoot, BUILD_TIMEOUT_MS);
+        if (!pullStep.ok) {
+          return { ok: false, stdout: pullStep.stdout, stderr: pullStep.stderr || 'git pull failed' };
+        }
+        const build = triggerBuild ? await runSiteBuild(name, 'git-pull') : null;
+        return {
+          ok: true,
+          stdout: JSON.stringify({ pulled: true, output: pullStep.stdout.trim(), build }),
+          stderr: '',
+        };
+      }
+
+      throw new Error(`Unsupported git action: ${gitAction}`);
+    }
+
+    case 'site.build': {
+      const name = validateName(params.name, 'site name');
+      const result = await runSiteBuild(name, 'manual');
+      return {
+        ok: result.queued ? true : Boolean(result.ok),
+        stdout: JSON.stringify(result),
+        stderr: result.ok === false ? 'One or more build steps failed; inspect step logs' : '',
+      };
+    }
+
+    case 'site.buildStatus': {
+      const name = validateName(params.name, 'site name');
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          name,
+          type: getSiteTypeFromVhost(name),
+          building: activeBuilds.has(name),
+          watch: isSiteWatcherEnabled(name),
+          lastBuild: readBuildStatus(name),
+        }),
+        stderr: '',
+      };
+    }
+
+    case 'site.watch': {
+      const name = validateName(params.name, 'site name');
+      if (params.enabled === undefined) {
+        return {
+          ok: true,
+          stdout: JSON.stringify({ name, watch: isSiteWatcherEnabled(name) }),
+          stderr: '',
+        };
+      }
+      if (Boolean(params.enabled)) {
+        const res = enableSiteWatcher(name, true);
+        return { ok: true, stdout: JSON.stringify({ name, watch: true, ...res }), stderr: '' };
+      }
+      disableSiteWatcher(name, true);
+      return { ok: true, stdout: JSON.stringify({ name, watch: false }), stderr: '' };
+    }
+
     default:
       throw new Error(`Unsupported action: ${String(action)}`);
   }
@@ -1142,7 +2247,7 @@ function createServer() {
     let buffer = '';
     let handled = false;
     socket.setEncoding('utf8');
-    socket.setTimeout(CERTBOT_TIMEOUT_MS + 5000);
+    socket.setTimeout(BUILD_TIMEOUT_MS + 10_000);
 
     const writeResponse = (resp) => {
       if (!socket.destroyed) {
@@ -1212,6 +2317,7 @@ function createServer() {
   server.listen(SOCKET_PATH, () => {
     fs.chownSync(SOCKET_PATH, 0, groupId);
     fs.chmodSync(SOCKET_PATH, 0o660);
+    startPersistedWatchers();
     console.log(`control-agent listening on ${SOCKET_PATH} (group=${SOCKET_GROUP}, mode=0660)`);
   });
 
@@ -1245,6 +2351,7 @@ module.exports = {
   listIngressRules,
   addIngressHostname,
   removeIngressHostname,
+  resolveJailedPath,
   NAME_RE,
   DOMAIN_RE,
   UNIT_RE,

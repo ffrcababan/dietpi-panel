@@ -31,10 +31,11 @@ Control Agent (/opt/control-agent/agent.js, systemd, runs as `root`)
   - Generates a 256-bit random API key (`openssl rand -hex 32`), prints it **once** to the UI, and stores `SetEnv APP_DB_PATH` + `SetEnv APP_API_KEY` in `/etc/apache2/conf-app-db/<name>.conf` (`0600 root:root`).
   - Symlinks `/var/www/_shared/db.php` into `/var/www/<name>/db.php`.
   - If no site vhost exists yet for `<name>`, creates a minimal `dbonly` Apache vhost (`<name>.<BASE_DOMAIN>`) allowing access solely to `/db.php`.
-- **Sites (`mksite <name> <type>`)**:
-  - Supports `static`, `php`, and `nextjs`.
-  - All templates include `IncludeOptional /etc/apache2/conf-app-db/__NAME__.conf`, so databases and sites with matching `<name>` compose seamlessly in either creation order.
-  - `nextjs` sites auto-assign a local port (`3100+`), configure Apache `ProxyPass` while excluding `/db.php` (`ProxyPass /db.php !`), and create `/etc/systemd/system/app-<name>.service`.
+- **Sites (`mksite <name> <type>`) & App Workspaces (`/sites/<name>`)**:
+  - Supports `static`, `php`, `laravel` (`/public` docroot), `react`, `vue`, `astro`, `sveltekit`, `nextjs`, `node`, and `python`.
+  - Creating a site automatically provisions its matching SQLite database by default (revealing the API key once and seeding `.env` / `.env.local` for framework apps), and exposes `/db.php` via Apache `Alias`.
+  - Built-in jailed file manager (`/var/www/<name>`), `.zip` upload/extract, Git `clone`/`pull`, and preset framework build pipelines (executed as `www-data` without raw shell strings).
+  - Optional per-site recursive filesystem watcher triggers the preset build pipeline automatically on SSH/SFTP file changes.
 - **Cloudflare Tunnel (`cloudflared`) Auto-Routing**:
   - When `cloudflared` and `/etc/cloudflared/config.yml` exist, creating a site or database automatically runs:
     1. `cloudflared tunnel route dns <tunnel> <hostname>` (using `~/.cloudflared/cert.pem` / `TUNNEL_ORIGIN_CERT`)

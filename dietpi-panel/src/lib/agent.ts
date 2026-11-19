@@ -15,7 +15,37 @@ export type AgentAction =
   | 'logs'
   | 'cert'
   | 'tunnel.route'
+  | 'files.list'
+  | 'files.read'
+  | 'files.write'
+  | 'files.upload'
+  | 'files.mkdir'
+  | 'files.rename'
+  | 'files.delete'
+  | 'site.git'
+  | 'site.build'
+  | 'site.buildStatus'
+  | 'site.watch'
   | 'activity.list';
+
+export interface BuildStepResult {
+  cmd: string;
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+}
+
+export interface SiteBuildRecord {
+  name: string;
+  type: string;
+  trigger: string;
+  ok: boolean;
+  startedAt: string;
+  finishedAt: string;
+  steps: BuildStepResult[];
+  queued?: boolean;
+}
 
 export interface TunnelActionResult {
   enabled: boolean;
@@ -50,12 +80,17 @@ export async function callControlAgent(
 
   const effectiveTimeout =
     timeoutMs ??
-    (action === 'cert' ||
-    action === 'tunnel.route' ||
-    action === 'site.create' ||
-    action === 'db.create'
-      ? 125_000
-      : 30_000);
+    (action === 'files.write' ||
+    action === 'files.upload' ||
+    action === 'site.git' ||
+    action === 'site.build'
+      ? 305_000
+      : action === 'cert' ||
+          action === 'tunnel.route' ||
+          action === 'site.create' ||
+          action === 'db.create'
+        ? 125_000
+        : 30_000);
 
   return new Promise<AgentResponse>((resolve, reject) => {
     const client = net.createConnection({ path: socketPath });

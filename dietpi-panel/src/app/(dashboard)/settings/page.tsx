@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { IconCheck, IconCopy, IconLock, IconShield } from '@/components/Icons';
 import { usePanel } from '@/components/PanelContext';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -14,6 +15,7 @@ interface TwoFactorSetup {
 }
 
 export default function SettingsPage() {
+  const router = useRouter();
   const { me, refreshMe } = usePanel();
 
   // Change password state
@@ -48,14 +50,24 @@ export default function SettingsPage() {
 
     setPwSaving(true);
     try {
-      await apiMutate('/api/auth/password', 'POST', me.csrfToken, {
-        currentPassword,
-        newPassword,
-      });
+      const res = await apiMutate<{ ok: boolean; csrfToken?: string }>(
+        '/api/auth/password',
+        'POST',
+        me.csrfToken,
+        {
+          currentPassword,
+          newPassword,
+        }
+      );
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
-      await refreshMe();
+      await refreshMe({
+        ...me,
+        mustChangePassword: false,
+        csrfToken: res.csrfToken || me.csrfToken,
+      });
+      router.refresh();
       setPwMessage({ ok: true, text: 'Administrator password updated successfully.' });
     } catch (err) {
       setPwMessage({

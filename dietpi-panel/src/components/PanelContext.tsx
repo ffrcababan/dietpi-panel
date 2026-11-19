@@ -16,7 +16,7 @@ export interface MeData {
 interface PanelContextValue {
   me: MeData | undefined;
   isLoading: boolean;
-  refreshMe: () => Promise<MeData | undefined>;
+  refreshMe: (nextData?: MeData) => Promise<MeData | undefined>;
 }
 
 const PanelContext = createContext<PanelContextValue>({
@@ -44,7 +44,8 @@ export function PanelProvider({
       value={{
         me: data,
         isLoading,
-        refreshMe: () => mutate(),
+        refreshMe: (nextData?: MeData) =>
+          nextData ? mutate(nextData, { revalidate: true }) : mutate(),
       }}
     >
       {children}

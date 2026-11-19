@@ -50,17 +50,23 @@ export async function POST(request: Request) {
   }
 
   if (user.totp_secret) {
-    const res = NextResponse.json({ ok: true, requiresTotp: true });
+    const res = NextResponse.json(
+      { ok: true, requiresTotp: true },
+      { headers: { 'Cache-Control': 'no-store, private' } }
+    );
     await issueSessionCookie(res, user, 'totp_pending');
     return res;
   }
 
   resetRateLimit(rlKey);
-  const res = NextResponse.json({
-    ok: true,
-    requiresTotp: false,
-    mustChangePassword: user.must_change_password === 1,
-  });
+  const res = NextResponse.json(
+    {
+      ok: true,
+      requiresTotp: false,
+      mustChangePassword: user.must_change_password === 1,
+    },
+    { headers: { 'Cache-Control': 'no-store, private' } }
+  );
   await issueSessionCookie(res, user, 'full');
   return res;
 }

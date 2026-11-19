@@ -22,6 +22,12 @@ function buildRedirectUrl(request: NextRequest, targetPath: string): URL {
   return new URL(targetPath, `${proto}://${host}`);
 }
 
+function noStoreRedirect(request: NextRequest, targetPath: string): NextResponse {
+  const res = NextResponse.redirect(buildRedirectUrl(request, targetPath));
+  res.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  return res;
+}
+
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
@@ -41,24 +47,27 @@ export async function middleware(request: NextRequest) {
   if (pathname === '/login') {
     if (isAuthenticated && payload) {
       const dest = payload.mustChangePassword ? '/settings' : '/';
-      return NextResponse.redirect(buildRedirectUrl(request, dest));
+      return noStoreRedirect(request, dest);
     }
     return NextResponse.next();
   }
 
   if (pathname.startsWith('/api/')) {
     if (!isAuthenticated) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401, headers: { 'Cache-Control': 'no-store, private' } }
+      );
     }
     return NextResponse.next();
   }
 
   if (!isAuthenticated || !payload) {
-    return NextResponse.redirect(buildRedirectUrl(request, '/login'));
+    return noStoreRedirect(request, '/login');
   }
 
   if (payload.mustChangePassword && pathname !== '/settings') {
-    return NextResponse.redirect(buildRedirectUrl(request, '/settings'));
+    return noStoreRedirect(request, '/settings');
   }
 
   return NextResponse.next();

@@ -25,7 +25,12 @@ export async function GET() {
   try {
     const resp = await callControlAgent('stats');
     const stats = parseAgentJson<PanelStats>(resp, 'Failed to fetch system statistics');
-    return NextResponse.json(stats);
+    return NextResponse.json(stats, {
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+        Pragma: 'no-cache',
+      },
+    });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : 'Failed to fetch stats' },

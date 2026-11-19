@@ -51,10 +51,18 @@ export async function POST(request: Request) {
   resetRateLimit(rlKey);
   resetRateLimit(`login:${ip}`);
 
-  const res = NextResponse.json({
-    ok: true,
-    mustChangePassword: pending.user.must_change_password === 1,
-  });
+  const res = NextResponse.json(
+    {
+      ok: true,
+      mustChangePassword: pending.user.must_change_password === 1,
+    },
+    {
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+        Pragma: 'no-cache',
+      },
+    }
+  );
   await issueSessionCookie(res, pending.user, 'full');
   return res;
 }

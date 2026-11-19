@@ -27,7 +27,15 @@ export async function GET(request: Request) {
       resp,
       'Failed to load activity feed'
     );
-    return NextResponse.json({ entries });
+    return NextResponse.json(
+      { entries },
+      {
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+          Pragma: 'no-cache',
+        },
+      }
+    );
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : 'Failed to load activity' },

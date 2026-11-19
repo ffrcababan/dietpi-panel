@@ -79,9 +79,11 @@ const MUTATING_ACTIONS = new Set([
   'files.uploadFinish',
   'files.mkdir',
   'files.rename',
+  'files.chmod',
   'files.delete',
   'site.git',
   'site.build',
+  'site.fixPermissions',
   'site.watch',
 ]);
 
@@ -739,11 +741,336 @@ function pruneStaleUploads() {
   }
 }
 
-function chownDirChain(siteRoot, leafDir, uid, gid) {
+function isEnvSecretFile(relPosix) {
+  const base = path.posix.basename(relPosix);
+  if (
+    base === '.env.example' ||
+    base === '.env.sample' ||
+    base === '.env.template' ||
+    base === '.env.dist'
+  ) {
+    return false;
+  }
+  return base === '.env' || base.startsWith('.env.') || /\.(pem|key)$/i.test(base);
+}
+
+function isGroupWritableRelDir(relPosix, siteType, hasDatabaseSqlite = false) {
+  if (!relPosix) return false;
+  const matchPrefix = (prefix) => relPosix === prefix || relPosix.startsWith(`${prefix}/`);
+  if (siteType === 'laravel') {
+    if (
+      matchPrefix('storage') ||
+      matchPrefix('bootstrap/cache') ||
+      matchPrefix('public/build') ||
+      matchPrefix('public/storage')
+    ) {
+      return true;
+    }
+    if (hasDatabaseSqlite && matchPrefix('database')) {
+      return true;
+    }
+    return false;
+  }
+  if (siteType === 'php') {
+    return (
+      matchPrefix('storage') ||
+      matchPrefix('bootstrap/cache') ||
+      matchPrefix('uploads') ||
+      matchPrefix('cache') ||
+      matchPrefix('logs') ||
+      matchPrefix('tmp') ||
+      matchPrefix('var') ||
+      matchPrefix('data')
+    );
+  }
+  if (siteType === 'nextjs' || siteType === 'node') {
+    return (
+      matchPrefix('uploads') ||
+      matchPrefix('logs') ||
+      matchPrefix('data') ||
+      matchPrefix('tmp')
+    );
+  }
+  if (siteType === 'python') {
+    return (
+      matchPrefix('instance') ||
+      matchPrefix('uploads') ||
+      matchPrefix('media') ||
+      matchPrefix('logs') ||
+      matchPrefix('tmp') ||
+      matchPrefix('data') ||
+      matchPrefix('var')
+    );
+  }
+  return false;
+}
+
+function hasShebangOrElf(absPath) {
+  let fd;
+  try {
+    fd = fs.openSync(absPath, 'r');
+    const buf = Buffer.alloc(4);
+    const bytesRead = fs.readSync(fd, buf, 0, 4, 0);
+    if (bytesRead >= 2 && buf[0] === 0x23 && buf[1] === 0x21) return true; // #!
+    if (
+      bytesRead >= 4 &&
+      buf[0] === 0x7f &&
+      buf[1] === 0x45 &&
+      buf[2] === 0x4c &&
+      buf[3] === 0x46
+    ) {
+      return true; // \x7fELF
+    }
+  } catch {
+    // ignore unreadable
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return false;
+}
+
+const NON_EXEC_ASSET_RE =
+  /\.(php|html?|css|scss|sass|less|json|xml|svg|png|jpe?g|gif|webp|avif|ico|woff2?|ttf|eot|md|txt|ya?ml|sql|lock|map|ts|tsx|jsx|d\.ts|log|sqlite|db)$/i;
+
+function isExecutableSiteFile(absPath, relPosix, currentMode = 0) {
+  const base = path.posix.basename(relPosix);
+  if (isEnvSecretFile(relPosix)) return false;
+
+  if (
+    relPosix === 'artisan' ||
+    relPosix === 'gradlew' ||
+    relPosix === 'mvnw' ||
+    relPosix.endsWith('.sh') ||
+    relPosix.startsWith('node_modules/.bin/') ||
+    relPosix.startsWith('vendor/bin/') ||
+    relPosix.startsWith('.venv/bin/') ||
+    relPosix.startsWith('venv/bin/') ||
+    relPosix.startsWith('bin/')
+  ) {
+    return true;
+  }
+
+  if (NON_EXEC_ASSET_RE.test(base)) {
+    return false;
+  }
+
+  if (
+    relPosix.includes('/bin/') ||
+    relPosix.startsWith('scripts/') ||
+    relPosix.startsWith('node_modules/') ||
+    relPosix.startsWith('.venv/') ||
+    relPosix.startsWith('venv/')
+  ) {
+    if (relPosix.includes('/bin/') || relPosix.startsWith('scripts/')) {
+      return (currentMode & 0o111) !== 0 || hasShebangOrElf(absPath);
+    }
+    if ((currentMode & 0o111) !== 0 && !base.endsWith('.js') && !base.endsWith('.mjs') && !base.endsWith('.cjs') && !base.endsWith('.py')) {
+      return hasShebangOrElf(absPath);
+    }
+  }
+
+  return false;
+}
+
+function getEffectiveSiteType(siteRoot, siteType) {
+  if (siteType === 'laravel' || fs.existsSync(path.join(siteRoot, 'artisan'))) {
+    return 'laravel';
+  }
+  return siteType || '';
+}
+
+function ensureModeIfNeeded(targetPath, lst, desiredMode) {
+  if ((lst.mode & 0o777) !== desiredMode) {
+    fs.chmodSync(targetPath, desiredMode);
+    return true;
+  }
+  return false;
+}
+
+function ensureOwnerIfNeeded(targetPath, lst, uid, gid) {
+  if (lst.uid !== uid || lst.gid !== gid) {
+    chownPathNoFollow(targetPath, uid, gid);
+    return true;
+  }
+  return false;
+}
+
+function ensureLaravelWritableDirs(siteRoot, uid, gid) {
+  const dirs = [
+    ['storage', 0o775],
+    ['storage/app', 0o775],
+    ['storage/app/public', 0o775],
+    ['storage/framework', 0o775],
+    ['storage/framework/cache', 0o775],
+    ['storage/framework/cache/data', 0o775],
+    ['storage/framework/sessions', 0o775],
+    ['storage/framework/testing', 0o775],
+    ['storage/framework/views', 0o775],
+    ['storage/logs', 0o775],
+    ['bootstrap', 0o755],
+    ['bootstrap/cache', 0o775],
+  ];
+  for (const [rel, mode] of dirs) {
+    const abs = path.join(siteRoot, rel);
+    try {
+      if (!fs.existsSync(abs)) {
+        fs.mkdirSync(abs, { recursive: true, mode });
+      }
+      const lst = fs.lstatSync(abs);
+      if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+      ensureOwnerIfNeeded(abs, lst, uid, gid);
+      ensureModeIfNeeded(abs, lst, mode);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function applySitePermissions(siteRoot, siteType = '', opts = {}) {
+  const { ensureFrameworkDirs = true } = opts;
+  const { uid, gid } = getWwwDataIds();
+  const effectiveType = getEffectiveSiteType(siteRoot, siteType);
+
+  let dirsUpdated = 0;
+  let filesUpdated = 0;
+  let executablesFixed = 0;
+
+  try {
+    const rootLst = fs.lstatSync(siteRoot);
+    if (!rootLst.isDirectory()) {
+      return { type: effectiveType || 'static', dirsUpdated, filesUpdated, executablesFixed, writableDirs: [] };
+    }
+    const ownerChanged = ensureOwnerIfNeeded(siteRoot, rootLst, uid, gid);
+    const modeChanged = ensureModeIfNeeded(siteRoot, rootLst, 0o755);
+    if (ownerChanged || modeChanged) dirsUpdated += 1;
+  } catch {
+    return { type: effectiveType || 'static', dirsUpdated, filesUpdated, executablesFixed, writableDirs: [] };
+  }
+
+  if (ensureFrameworkDirs && effectiveType === 'laravel') {
+    ensureLaravelWritableDirs(siteRoot, uid, gid);
+  }
+
+  let hasDatabaseSqlite = false;
+  if (effectiveType === 'laravel') {
+    try {
+      const dbSub = path.join(siteRoot, 'database');
+      if (fs.existsSync(dbSub) && fs.lstatSync(dbSub).isDirectory()) {
+        hasDatabaseSqlite = fs
+          .readdirSync(dbSub)
+          .some((f) => f.endsWith('.sqlite') || f.endsWith('.sqlite3') || f.endsWith('.db'));
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const writableDirsFound = new Set();
+  const stack = [{ absDir: siteRoot, relDir: '' }];
+
+  while (stack.length > 0) {
+    const { absDir, relDir } = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const abs = path.join(absDir, entry.name);
+      const relPosix = relDir ? `${relDir}/${entry.name}` : entry.name;
+      let lst;
+      try {
+        lst = fs.lstatSync(abs);
+      } catch {
+        continue;
+      }
+
+      if (lst.isSymbolicLink()) {
+        // Never follow symlinks on chmod (protects shared /db.php target!)
+        ensureOwnerIfNeeded(abs, lst, uid, gid);
+        continue;
+      }
+
+      if (lst.isDirectory()) {
+        const isWritable = isGroupWritableRelDir(relPosix, effectiveType, hasDatabaseSqlite);
+        if (
+          isWritable &&
+          (relPosix === 'storage' ||
+            relPosix === 'bootstrap/cache' ||
+            relPosix === 'uploads' ||
+            relPosix === 'logs' ||
+            relPosix === 'cache' ||
+            relPosix === 'instance' ||
+            relPosix === 'database')
+        ) {
+          writableDirsFound.add(relPosix);
+        }
+        const desiredDirMode = isWritable ? 0o775 : 0o755;
+        const ownerChanged = ensureOwnerIfNeeded(abs, lst, uid, gid);
+        const modeChanged = ensureModeIfNeeded(abs, lst, desiredDirMode);
+        if (ownerChanged || modeChanged) dirsUpdated += 1;
+        stack.push({ absDir: abs, relDir: relPosix });
+      } else if (lst.isFile()) {
+        let desiredFileMode;
+        if (isEnvSecretFile(relPosix)) {
+          desiredFileMode = 0o640;
+        } else if (isExecutableSiteFile(abs, relPosix, lst.mode)) {
+          desiredFileMode = 0o755;
+        } else if (isGroupWritableRelDir(relDir, effectiveType, hasDatabaseSqlite)) {
+          desiredFileMode = 0o664;
+        } else {
+          desiredFileMode = 0o644;
+        }
+        const ownerChanged = ensureOwnerIfNeeded(abs, lst, uid, gid);
+        const modeChanged = ensureModeIfNeeded(abs, lst, desiredFileMode);
+        if (ownerChanged || modeChanged) filesUpdated += 1;
+        if (modeChanged && desiredFileMode === 0o755) executablesFixed += 1;
+      }
+    }
+  }
+
+  return {
+    type: effectiveType || siteType || 'static',
+    dirsUpdated,
+    filesUpdated,
+    executablesFixed,
+    writableDirs: Array.from(writableDirsFound).sort(),
+  };
+}
+
+function chownDirChain(siteRoot, leafDir, uid, gid, siteType = '') {
+  const effectiveType = getEffectiveSiteType(siteRoot, siteType);
   let cursor = leafDir;
   while (cursor !== siteRoot && cursor.startsWith(`${siteRoot}${path.sep}`)) {
-    chownPathNoFollow(cursor, uid, gid);
+    const relCursor = path.relative(siteRoot, cursor).split(path.sep).join('/');
+    const desiredDirMode = isGroupWritableRelDir(relCursor, effectiveType, false) ? 0o775 : 0o755;
+    try {
+      const lst = fs.lstatSync(cursor);
+      if (!lst.isSymbolicLink()) {
+        ensureOwnerIfNeeded(cursor, lst, uid, gid);
+        ensureModeIfNeeded(cursor, lst, desiredDirMode);
+      }
+    } catch {
+      chownPathNoFollow(cursor, uid, gid);
+    }
     cursor = path.dirname(cursor);
+  }
+  try {
+    const rootLst = fs.lstatSync(siteRoot);
+    if (!rootLst.isSymbolicLink()) {
+      ensureOwnerIfNeeded(siteRoot, rootLst, uid, gid);
+      ensureModeIfNeeded(siteRoot, rootLst, 0o755);
+    }
+  } catch {
+    // ignore
   }
 }
 
@@ -768,11 +1095,12 @@ async function installUploadedFile({
     protectDbPhp: true,
   });
 
+  const siteType = getSiteTypeFromVhost(name);
   const parentDir = path.dirname(targetPath);
   fs.mkdirSync(parentDir, { recursive: true, mode: 0o755 });
 
   const { uid, gid } = getWwwDataIds();
-  chownDirChain(siteRoot, parentDir, uid, gid);
+  chownDirChain(siteRoot, parentDir, uid, gid, siteType);
 
   const totalBytes = sourcePath ? fs.statSync(sourcePath).size : buffer.length;
   let extractedFiles = 0;
@@ -806,31 +1134,57 @@ async function installUploadedFile({
           if (destDir === siteRoot && entry.name === 'db.php') {
             continue;
           }
+          const relDest = path.relative(siteRoot, d).split(path.sep).join('/');
+          const effectiveType = getEffectiveSiteType(siteRoot, siteType);
           if (lst.isDirectory()) {
-            fs.mkdirSync(d, { recursive: true, mode: 0o755 });
+            const dMode = isGroupWritableRelDir(relDest, effectiveType, false) ? 0o775 : 0o755;
+            fs.mkdirSync(d, { recursive: true, mode: dMode });
+            fs.chmodSync(d, dMode);
             chownPathNoFollow(d, uid, gid);
             copySafe(s, d);
           } else {
             fs.copyFileSync(s, d);
-            fs.chmodSync(d, entry.name.startsWith('.env') ? 0o640 : 0o644);
+            const relParent = path.posix.dirname(relDest) === '.' ? '' : path.posix.dirname(relDest);
+            let fMode;
+            if (isEnvSecretFile(relDest)) {
+              fMode = 0o640;
+            } else if (isExecutableSiteFile(d, relDest, lst.mode)) {
+              fMode = 0o755;
+            } else if (isGroupWritableRelDir(relParent, effectiveType, false)) {
+              fMode = 0o664;
+            } else {
+              fMode = 0o644;
+            }
+            fs.chmodSync(d, fMode);
             chownPathNoFollow(d, uid, gid);
             extractedFiles += 1;
           }
         }
       };
       copySafe(extractDir, parentDir);
+      applySitePermissions(siteRoot, siteType, { ensureFrameworkDirs: true });
     } finally {
       fs.rmSync(stageDir, { recursive: true, force: true });
     }
   } else {
+    const effectiveType = getEffectiveSiteType(siteRoot, siteType);
+    const relParent = path.posix.dirname(relPath) === '.' ? '' : path.posix.dirname(relPath);
     if (sourcePath) {
       fs.copyFileSync(sourcePath, targetPath);
-      fs.chmodSync(targetPath, filename.startsWith('.env') ? 0o640 : 0o644);
     } else {
-      fs.writeFileSync(targetPath, buffer, {
-        mode: filename.startsWith('.env') ? 0o640 : 0o644,
-      });
+      fs.writeFileSync(targetPath, buffer);
     }
+    let fMode;
+    if (isEnvSecretFile(relPath)) {
+      fMode = 0o640;
+    } else if (isExecutableSiteFile(targetPath, relPath, 0)) {
+      fMode = 0o755;
+    } else if (isGroupWritableRelDir(relParent, effectiveType, false)) {
+      fMode = 0o664;
+    } else {
+      fMode = 0o644;
+    }
+    fs.chmodSync(targetPath, fMode);
     chownPathNoFollow(targetPath, uid, gid);
   }
 
@@ -1039,7 +1393,13 @@ function findExecutable(candidates) {
 
 async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv = {}) {
   const { uid, gid } = getWwwDataIds();
+  const wwwHome = '/tmp/dp-www-home';
   const cacheDirs = [
+    wwwHome,
+    path.join(wwwHome, '.cache'),
+    path.join(wwwHome, '.config'),
+    path.join(wwwHome, '.local'),
+    path.join(wwwHome, '.local', 'share'),
     '/tmp/npm-cache-www-data',
     '/tmp/composer-www-data',
     '/tmp/pip-cache-www-data',
@@ -1048,7 +1408,19 @@ async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o750 });
     }
-    chownPathNoFollow(dir, uid, gid);
+    try {
+      const lst = fs.lstatSync(dir);
+      if (lst.isDirectory()) {
+        if (lst.uid !== uid || lst.gid !== gid) {
+          chownRecursiveSafe(dir, uid, gid);
+        }
+        if ((lst.mode & 0o777) !== 0o750) {
+          fs.chmodSync(dir, 0o750);
+        }
+      }
+    } catch {
+      chownPathNoFollow(dir, uid, gid);
+    }
   }
 
   const start = Date.now();
@@ -1062,7 +1434,10 @@ async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv
       maxBuffer: 4 * 1024 * 1024,
       env: {
         PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-        HOME: '/tmp',
+        HOME: wwwHome,
+        XDG_CACHE_HOME: path.join(wwwHome, '.cache'),
+        XDG_CONFIG_HOME: path.join(wwwHome, '.config'),
+        XDG_DATA_HOME: path.join(wwwHome, '.local', 'share'),
         NPM_CONFIG_CACHE: '/tmp/npm-cache-www-data',
         COMPOSER_HOME: '/tmp/composer-www-data',
         PIP_CACHE_DIR: '/tmp/pip-cache-www-data',
@@ -1139,6 +1514,16 @@ async function executeSiteBuildOnce(name, trigger = 'manual') {
     if (!step.ok) allOk = false;
     return step.ok;
   };
+
+  const tPermPre = Date.now();
+  const permPre = applySitePermissions(siteRoot, type, { ensureFrameworkDirs: true });
+  steps.push({
+    cmd: `permissions (${permPre.type})`,
+    ok: true,
+    stdout: `Verified www-data ownership & Linux permissions (dirs updated: ${permPre.dirsUpdated}, files updated: ${permPre.filesUpdated}, executables +x: ${permPre.executablesFixed}${permPre.writableDirs.length ? `, writable 0775: ${permPre.writableDirs.join(', ')}` : ''}).`,
+    stderr: '',
+    durationMs: Date.now() - tPermPre,
+  });
 
   if (type === 'static' || type === 'dbonly') {
     steps.push({
@@ -1270,6 +1655,9 @@ async function executeSiteBuildOnce(name, trigger = 'manual') {
       if (!rst.ok) allOk = false;
     }
   }
+
+  // Re-normalize permissions on generated build artifacts (vendor/, node_modules/, .next/, storage/, bootstrap/cache/)
+  applySitePermissions(siteRoot, type, { ensureFrameworkDirs: true });
 
   const record = {
     name,
@@ -1973,6 +2361,7 @@ async function handleAction(action, params = {}, socket = null) {
           path: relPath ? `${relPath}/${dirent.name}` : dirent.name,
           type,
           size: lst.size,
+          mode: `0${(lst.mode & 0o777).toString(8).padStart(3, '0')}`,
           modified: lst.mtime.toISOString(),
         });
       }
@@ -2032,18 +2421,27 @@ async function handleAction(action, params = {}, socket = null) {
         allowMissingLeaf: true,
         protectDbPhp: true,
       });
+      const siteType = getSiteTypeFromVhost(name);
+      const effectiveType = getEffectiveSiteType(siteRoot, siteType);
       const parentDir = path.dirname(targetPath);
       if (!fs.existsSync(parentDir)) {
         fs.mkdirSync(parentDir, { recursive: true, mode: 0o755 });
       }
-      const isEnv = path.basename(targetPath).startsWith('.env');
-      fs.writeFileSync(targetPath, params.content, { mode: isEnv ? 0o640 : 0o644 });
+      fs.writeFileSync(targetPath, params.content);
       const { uid, gid } = getWwwDataIds();
-      let dirCursor = parentDir;
-      while (dirCursor !== siteRoot && dirCursor.startsWith(`${siteRoot}${path.sep}`)) {
-        chownPathNoFollow(dirCursor, uid, gid);
-        dirCursor = path.dirname(dirCursor);
+      chownDirChain(siteRoot, parentDir, uid, gid, effectiveType);
+      const relParent = path.posix.dirname(relPath) === '.' ? '' : path.posix.dirname(relPath);
+      let fileMode;
+      if (isEnvSecretFile(relPath)) {
+        fileMode = 0o640;
+      } else if (isExecutableSiteFile(targetPath, relPath, 0)) {
+        fileMode = 0o755;
+      } else if (isGroupWritableRelDir(relParent, effectiveType, false)) {
+        fileMode = 0o664;
+      } else {
+        fileMode = 0o644;
       }
+      fs.chmodSync(targetPath, fileMode);
       chownPathNoFollow(targetPath, uid, gid);
 
       const triggerBuild = params.triggerBuild !== false;
@@ -2146,14 +2544,15 @@ async function handleAction(action, params = {}, socket = null) {
 
     case 'files.mkdir': {
       const name = validateName(params.name, 'site name');
-      const { targetPath, relPath } = resolveJailedPath(name, params.path, {
+      const { siteRoot, targetPath, relPath } = resolveJailedPath(name, params.path, {
         allowRoot: false,
         allowMissingLeaf: true,
         protectDbPhp: true,
       });
+      const siteType = getSiteTypeFromVhost(name);
       fs.mkdirSync(targetPath, { recursive: true, mode: 0o755 });
       const { uid, gid } = getWwwDataIds();
-      chownRecursiveSafe(targetPath, uid, gid);
+      chownDirChain(siteRoot, targetPath, uid, gid, siteType);
       return { ok: true, stdout: JSON.stringify({ path: relPath }), stderr: '' };
     }
 
@@ -2174,10 +2573,79 @@ async function handleAction(action, params = {}, socket = null) {
       fs.mkdirSync(path.dirname(toRes.targetPath), { recursive: true, mode: 0o755 });
       movePathSafe(fromRes.targetPath, toRes.targetPath);
       const { uid, gid } = getWwwDataIds();
+      const siteType = getSiteTypeFromVhost(name);
+      chownDirChain(toRes.siteRoot, path.dirname(toRes.targetPath), uid, gid, siteType);
       chownRecursiveSafe(toRes.targetPath, uid, gid);
       return {
         ok: true,
         stdout: JSON.stringify({ fromPath: fromRes.relPath, toPath: toRes.relPath }),
+        stderr: '',
+      };
+    }
+
+    case 'files.chmod': {
+      const name = validateName(params.name, 'site name');
+      const siteType = getSiteTypeFromVhost(name);
+      const { siteRoot, targetPath, relPath } = resolveJailedPath(name, params.path, {
+        allowRoot: false,
+        protectDbPhp: true,
+      });
+      const modeStr = typeof params.mode === 'string' ? params.mode.trim() : '';
+      if (!/^0?[0-7]{3}$/.test(modeStr)) {
+        throw new Error('Mode must be a 3-digit or 4-digit octal permission (e.g. 0644, 0755, 0775)');
+      }
+      const parsedMode = Number.parseInt(modeStr, 8);
+      if ((parsedMode & 0o002) !== 0) {
+        throw new Error('World-writable modes (e.g. 777) are blocked for security; use 775 with www-data ownership');
+      }
+      const rootLst = fs.lstatSync(targetPath);
+      if (rootLst.isSymbolicLink()) {
+        throw new Error('Cannot chmod a symbolic link');
+      }
+      const { uid, gid } = getWwwDataIds();
+      const recursive = Boolean(params.recursive);
+      let updatedCount = 0;
+
+      const applySingle = (absPath, lst) => {
+        if (lst.isSymbolicLink()) return;
+        const rel = path.relative(siteRoot, absPath).split(path.sep).join('/');
+        if (rel === 'db.php') return;
+        ensureOwnerIfNeeded(absPath, lst, uid, gid);
+        fs.chmodSync(absPath, parsedMode);
+        updatedCount += 1;
+      };
+
+      if (recursive && rootLst.isDirectory()) {
+        const stack = [targetPath];
+        while (stack.length > 0) {
+          const cur = stack.pop();
+          let st;
+          try {
+            st = fs.lstatSync(cur);
+          } catch {
+            continue;
+          }
+          if (st.isSymbolicLink()) continue;
+          applySingle(cur, st);
+          if (st.isDirectory()) {
+            for (const entry of fs.readdirSync(cur, { withFileTypes: true })) {
+              stack.push(path.join(cur, entry.name));
+            }
+          }
+        }
+      } else {
+        applySingle(targetPath, rootLst);
+      }
+
+      return {
+        ok: true,
+        stdout: JSON.stringify({
+          path: relPath,
+          mode: `0${parsedMode.toString(8).padStart(3, '0')}`,
+          recursive: recursive && rootLst.isDirectory(),
+          updatedCount,
+          type: siteType,
+        }),
         stderr: '',
       };
     }
@@ -2272,7 +2740,9 @@ async function handleAction(action, params = {}, socket = null) {
             }
             movePathSafe(src, dest);
           }
-          chownRecursiveSafe(siteRoot, uid, gid);
+          applySitePermissions(siteRoot, getSiteTypeFromVhost(name), {
+            ensureFrameworkDirs: true,
+          });
         } finally {
           fs.rmSync(stageDir, { recursive: true, force: true });
         }
@@ -2295,6 +2765,9 @@ async function handleAction(action, params = {}, socket = null) {
         if (!pullStep.ok) {
           return { ok: false, stdout: pullStep.stdout, stderr: pullStep.stderr || 'git pull failed' };
         }
+        applySitePermissions(siteRoot, getSiteTypeFromVhost(name), {
+          ensureFrameworkDirs: true,
+        });
         const build = triggerBuild ? await runSiteBuild(name, 'git-pull') : null;
         return {
           ok: true,
@@ -2313,6 +2786,24 @@ async function handleAction(action, params = {}, socket = null) {
         ok: result.queued ? true : Boolean(result.ok),
         stdout: JSON.stringify(result),
         stderr: result.ok === false ? 'One or more build steps failed; inspect step logs' : '',
+      };
+    }
+
+    case 'site.fixPermissions': {
+      const name = validateName(params.name, 'site name');
+      const rootDir = `/var/www/${name}`;
+      if (!fs.existsSync(rootDir)) {
+        throw new Error(`Site "${name}" directory does not exist`);
+      }
+      const siteRoot = fs.realpathSync(rootDir);
+      const siteType = getSiteTypeFromVhost(name);
+      const summary = applySitePermissions(siteRoot, siteType, {
+        ensureFrameworkDirs: true,
+      });
+      return {
+        ok: true,
+        stdout: JSON.stringify(summary),
+        stderr: '',
       };
     }
 

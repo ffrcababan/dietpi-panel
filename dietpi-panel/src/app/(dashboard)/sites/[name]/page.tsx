@@ -62,6 +62,11 @@ export default function SiteWorkspacePage({
   const [renameTarget, setRenameTarget] = useState<FileEntry | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<FileEntry | null>(null);
+  const [permsTarget, setPermsTarget] = useState<FileEntry | null>(null);
+  const [permsMode, setPermsMode] = useState('0644');
+  const [permsRecursive, setPermsRecursive] = useState(false);
+  const [permsBusy, setPermsBusy] = useState(false);
+  const [fixingPerms, setFixingPerms] = useState(false);
 
   // Git & Build state
   const [repoUrl, setRepoUrl] = useState('');
@@ -452,6 +457,19 @@ export default function SiteWorkspacePage({
         completedBytes += item.file.size;
       }
 
+      if (!singleMode && !uploadAutoBuild) {
+        setUploadProgress({
+          percent: 98,
+          label: `Applying ${siteType} file & folder permissions...`,
+        });
+        await apiMutate(
+          `/api/sites/${encodeURIComponent(siteName)}/files`,
+          'POST',
+          me.csrfToken,
+          { op: 'fixPermissions' }
+        );
+      }
+
       if (!singleMode && uploadAutoBuild) {
         setUploadProgress({
           percent: 99,
@@ -540,6 +558,75 @@ export default function SiteWorkspacePage({
         ok: false,
         text: err instanceof Error ? err.message : 'Delete failed',
       });
+    }
+  };
+
+  const handleFixPermissions = async () => {
+    if (!me?.csrfToken || fixingPerms) return;
+    setFixingPerms(true);
+    setBanner(null);
+    try {
+      const res = await apiMutate<{
+        result: {
+          type: string;
+          dirsUpdated: number;
+          filesUpdated: number;
+          executablesFixed: number;
+          writableDirs: string[];
+        };
+      }>(`/api/sites/${encodeURIComponent(siteName)}/files`, 'POST', me.csrfToken, {
+        op: 'fixPermissions',
+      });
+      const r = res.result;
+      setBanner({
+        ok: true,
+        text: `Applied www-data ownership & ${r.type} permissions (dirs updated: ${r.dirsUpdated}, files updated: ${r.filesUpdated}${
+          r.executablesFixed ? `, +x binaries: ${r.executablesFixed}` : ''
+        }${r.writableDirs.length ? `, writable 0775: ${r.writableDirs.join(', ')}` : ''}).`,
+      });
+      await mutateFiles();
+    } catch (err) {
+      setBanner({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Failed to fix permissions',
+      });
+    } finally {
+      setFixingPerms(false);
+    }
+  };
+
+  const handleChmod = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!me?.csrfToken || !permsTarget || permsBusy) return;
+    setPermsBusy(true);
+    setBanner(null);
+    try {
+      const res = await apiMutate<{
+        result: {
+          path: string;
+          mode: string;
+          recursive: boolean;
+          updatedCount: number;
+        };
+      }>(`/api/sites/${encodeURIComponent(siteName)}/files`, 'POST', me.csrfToken, {
+        op: 'chmod',
+        path: permsTarget.path,
+        mode: permsMode.trim(),
+        recursive: permsTarget.type === 'dir' && permsRecursive,
+      });
+      setPermsTarget(null);
+      setBanner({
+        ok: true,
+        text: `Updated ${res.result.path} to ${res.result.mode} (${res.result.updatedCount} item(s), owner www-data).`,
+      });
+      await mutateFiles();
+    } catch (err) {
+      setBanner({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Failed to update permissions',
+      });
+    } finally {
+      setPermsBusy(false);
     }
   };
 
@@ -687,6 +774,29 @@ export default function SiteWorkspacePage({
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
             <span>Upload Web App</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={fixingPerms}
+            onClick={handleFixPermissions}
+            className="inline-flex items-center gap-2 rounded-lg border border-borderline bg-surface px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 disabled:opacity-50 transition"
+            title="Apply www-data ownership and recommended framework file/folder permissions (755/644, +x binaries, Laravel 775 storage)"
+          >
+            <svg
+              className="w-3.5 h-3.5 text-emerald-400"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              <polyline points="9 12 11 14 15 10" />
+            </svg>
+            <span>{fixingPerms ? 'Fixing Perms...' : 'Fix Permissions'}</span>
           </button>
 
           <button
@@ -889,14 +999,47 @@ export default function SiteWorkspacePage({
                             {entry.name}
                           </span>
                         </div>
-                        <div className="mt-0.5 text-[11px] text-slate-500 font-mono">
-                          {entry.type === 'dir' ? 'folder' : formatBytes(entry.size)} ·{' '}
-                          {formatDateTime(entry.modified)}
+                        <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500 font-mono">
+                          <span>
+                            {entry.type === 'dir' ? 'folder' : formatBytes(entry.size)}
+                          </span>
+                          {entry.mode && (
+                            <span
+                              className={`rounded px-1 py-0.2 text-[10px] ${
+                                entry.mode === '0775'
+                                  ? 'bg-emerald-500/15 text-emerald-300'
+                                  : entry.mode === '0640'
+                                    ? 'bg-amber-500/15 text-amber-300'
+                                    : entry.mode === '0755' && entry.type === 'file'
+                                      ? 'bg-sky-500/15 text-sky-300'
+                                      : 'bg-slate-700/40 text-slate-400'
+                              }`}
+                            >
+                              {entry.mode}
+                            </span>
+                          )}
+                          <span>· {formatDateTime(entry.modified)}</span>
                         </div>
                       </button>
 
                       {!isManagedLink && (
                         <div className="flex items-center gap-1 shrink-0">
+                          {entry.type !== 'symlink' && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setPermsTarget(entry);
+                                setPermsMode(
+                                  entry.mode || (entry.type === 'dir' ? '0755' : '0644')
+                                );
+                                setPermsRecursive(false);
+                              }}
+                              className="rounded px-1.5 py-1 text-[11px] text-slate-400 hover:bg-elevated hover:text-emerald-300"
+                              title="Change POSIX permissions"
+                            >
+                              Perms
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => {
@@ -1443,6 +1586,24 @@ export default function SiteWorkspacePage({
             <span>Automatically run {siteType} build pipeline after upload</span>
           </label>
 
+          <div className="rounded-lg border border-borderline bg-canvas/70 px-3 py-2 text-[11px] text-slate-400">
+            <span className="font-medium text-slate-300">Auto-Permissions:</span>{' '}
+            Owned by <span className="font-mono text-slate-200">www-data</span> · Folders{' '}
+            <span className="font-mono text-slate-200">0755</span> · Files{' '}
+            <span className="font-mono text-slate-200">0644</span> ·{' '}
+            <span className="font-mono text-slate-200">.env*</span>{' '}
+            <span className="font-mono text-amber-300">0640</span> · Binaries/scripts{' '}
+            <span className="font-mono text-sky-300">0755</span>
+            {siteType === 'laravel' ? (
+              <>
+                {' '}
+                · Laravel <span className="font-mono text-emerald-300">storage/</span> &amp;{' '}
+                <span className="font-mono text-emerald-300">bootstrap/cache/</span>{' '}
+                <span className="font-mono text-emerald-300">0775</span>
+              </>
+            ) : null}
+          </div>
+
           {/* Real-time progress bar */}
           {uploading && uploadProgress && (
             <div className="space-y-1.5 rounded-lg border border-borderline bg-canvas p-3">
@@ -1560,6 +1721,100 @@ export default function SiteWorkspacePage({
               </button>
             </div>
           </div>
+        )}
+      </Modal>
+
+      {/* File / Folder Permissions Modal */}
+      <Modal
+        open={Boolean(permsTarget)}
+        title="File & Folder Permissions"
+        subtitle="Files remain owned by www-data:www-data. Use 0775 (not 0777) for framework writable folders like Laravel storage/ and bootstrap/cache/."
+        onClose={() => {
+          if (!permsBusy) setPermsTarget(null);
+        }}
+      >
+        {permsTarget && (
+          <form onSubmit={handleChmod} className="space-y-4">
+            <div className="rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-xs text-slate-200 truncate">
+              /{permsTarget.path} ({permsTarget.type})
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
+                Quick Presets
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  { mode: '0644', label: '0644 · Standard File', desc: 'rw-r--r--' },
+                  { mode: '0755', label: '0755 · Folder / Script', desc: 'rwxr-xr-x' },
+                  { mode: '0775', label: '0775 · Writable Dir', desc: 'Laravel storage / cache' },
+                  { mode: '0640', label: '0640 · .env Secret', desc: 'rw-r-----' },
+                ].map((opt) => (
+                  <button
+                    key={opt.mode}
+                    type="button"
+                    disabled={permsBusy}
+                    onClick={() => setPermsMode(opt.mode)}
+                    className={`rounded-lg border px-3 py-2 text-left text-xs transition ${
+                      permsMode === opt.mode
+                        ? 'border-accent/60 bg-accent/15 text-slate-100'
+                        : 'border-borderline bg-canvas text-slate-400 hover:border-slate-500'
+                    }`}
+                  >
+                    <div className="font-mono font-medium text-slate-200">{opt.label}</div>
+                    <div className="text-[10px] text-slate-500">{opt.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-400">
+                Octal Mode
+              </label>
+              <input
+                type="text"
+                required
+                disabled={permsBusy}
+                pattern="^0?[0-7]{3}$"
+                placeholder="e.g. 0755 or 0775"
+                value={permsMode}
+                onChange={(e) => setPermsMode(e.target.value)}
+                className="w-full rounded-lg border border-borderline bg-canvas px-3 py-2 font-mono text-sm text-slate-100 focus:border-accent focus:outline-none"
+              />
+            </div>
+
+            {permsTarget.type === 'dir' && (
+              <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  disabled={permsBusy}
+                  checked={permsRecursive}
+                  onChange={(e) => setPermsRecursive(e.target.checked)}
+                  className="rounded border-borderline bg-canvas text-accent"
+                />
+                <span>Apply recursively to all subfolders and files inside</span>
+              </label>
+            )}
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={permsBusy}
+                onClick={() => setPermsTarget(null)}
+                className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs text-slate-300 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={permsBusy}
+                className="rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-slate-950 disabled:opacity-50"
+              >
+                {permsBusy ? 'Applying...' : 'Apply Permissions'}
+              </button>
+            </div>
+          </form>
         )}
       </Modal>
     </div>

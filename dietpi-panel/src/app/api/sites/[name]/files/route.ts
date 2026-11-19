@@ -23,6 +23,7 @@ export interface FileEntry {
   path: string;
   type: 'dir' | 'file' | 'symlink';
   size: number;
+  mode?: string;
   modified: string;
 }
 
@@ -115,6 +116,8 @@ export async function POST(
     contentBase64?: unknown;
     extractZip?: unknown;
     triggerBuild?: unknown;
+    mode?: unknown;
+    recursive?: unknown;
   };
   try {
     body = (await request.json()) as typeof body;
@@ -166,8 +169,8 @@ export async function POST(
             { status: 400 }
           );
         }
-        if (typeof body.contentBase64 !== 'string' || !body.contentBase64) {
-          return NextResponse.json({ error: 'File payload is empty' }, { status: 400 });
+        if (typeof body.contentBase64 !== 'string') {
+          return NextResponse.json({ error: 'Invalid file payload' }, { status: 400 });
         }
         const resp = await callControlAgent('files.upload', {
           name: nameCheck.value,
@@ -249,6 +252,70 @@ export async function POST(
           );
         }
         return NextResponse.json({ ok: true }, { headers: NO_STORE_HEADERS });
+      }
+
+      case 'chmod': {
+        const pathCheck = validateRelativePath(body.path, false);
+        if (!pathCheck.ok) {
+          return NextResponse.json({ error: pathCheck.error }, { status: 400 });
+        }
+        const rawMode = typeof body.mode === 'string' ? body.mode.trim() : '';
+        if (!/^0?[0-7]{3}$/.test(rawMode)) {
+          return NextResponse.json(
+            { error: 'Mode must be a 3 or 4 digit octal permission (e.g. 0644, 0755, 0775)' },
+            { status: 400 }
+          );
+        }
+        const parsedMode = Number.parseInt(rawMode, 8);
+        if ((parsedMode & 0o002) !== 0) {
+          return NextResponse.json(
+            {
+              error:
+                'World-writable modes (e.g. 777) are blocked for security; use 775 with www-data ownership',
+            },
+            { status: 400 }
+          );
+        }
+        const resp = await callControlAgent('files.chmod', {
+          name: nameCheck.value,
+          path: pathCheck.value,
+          mode: rawMode,
+          recursive: Boolean(body.recursive),
+        });
+        if (!resp.ok) {
+          return NextResponse.json(
+            { error: resp.stderr || 'Failed to update permissions' },
+            { status: 400 }
+          );
+        }
+        const result = parseAgentJson<{
+          path: string;
+          mode: string;
+          recursive: boolean;
+          updatedCount: number;
+          type: string;
+        }>(resp, 'Invalid chmod response');
+        return NextResponse.json({ result }, { headers: NO_STORE_HEADERS });
+      }
+
+      case 'fixPermissions': {
+        const resp = await callControlAgent('site.fixPermissions', {
+          name: nameCheck.value,
+        });
+        if (!resp.ok) {
+          return NextResponse.json(
+            { error: resp.stderr || 'Failed to repair site permissions' },
+            { status: 400 }
+          );
+        }
+        const result = parseAgentJson<{
+          type: string;
+          dirsUpdated: number;
+          filesUpdated: number;
+          executablesFixed: number;
+          writableDirs: string[];
+        }>(resp, 'Invalid permissions repair response');
+        return NextResponse.json({ result }, { headers: NO_STORE_HEADERS });
       }
 
       default:

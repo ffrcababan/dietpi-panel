@@ -10,6 +10,8 @@ WorkingDirectory=/var/www/__NAME__
 Environment=NODE_ENV=production
 Environment=PORT=__PORT__
 Environment=HOSTNAME=127.0.0.1
+Environment=HOME=/tmp
+Environment=NPM_CONFIG_CACHE=/tmp/.npm
 ExecStart=/usr/bin/env npm run start
 Restart=always
 RestartSec=5

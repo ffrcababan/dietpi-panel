@@ -24,9 +24,11 @@ export type AgentAction =
   | 'files.uploadFinish'
   | 'files.mkdir'
   | 'files.rename'
+  | 'files.chmod'
   | 'files.delete'
   | 'site.git'
   | 'site.build'
+  | 'site.fixPermissions'
   | 'site.buildStatus'
   | 'site.watch'
   | 'activity.list';
@@ -92,7 +94,9 @@ export async function callControlAgent(
       : action === 'cert' ||
           action === 'tunnel.route' ||
           action === 'site.create' ||
-          action === 'db.create'
+          action === 'db.create' ||
+          action === 'site.fixPermissions' ||
+          action === 'files.chmod'
         ? 125_000
         : 30_000);
 

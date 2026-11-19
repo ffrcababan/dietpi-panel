@@ -127,6 +127,9 @@ install -m 0644 -o root -g root "${REPO_DIR}/templates/systemd/app-nextjs.servic
 install -m 0644 -o root -g root "${REPO_DIR}/templates/systemd/app-service.tmpl" /etc/skel/app-service.tmpl
 
 install -m 0750 -o root -g root "${REPO_DIR}/control-agent/agent.js" /opt/control-agent/agent.js
+mkdir -p /usr/local/lib/dietpi-panel
+chmod 0755 /usr/local/lib/dietpi-panel
+install -m 0644 -o root -g root "${REPO_DIR}/control-agent/db-studio.php" /usr/local/lib/dietpi-panel/db-studio.php
 
 # 6. Generate or preserve secrets idempotently
 AGENT_SECRET=""

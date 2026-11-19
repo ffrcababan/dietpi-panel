@@ -6,6 +6,8 @@ export type AgentAction =
   | 'db.create'
   | 'db.list'
   | 'db.delete'
+  | 'db.inspect'
+  | 'db.mutate'
   | 'site.create'
   | 'site.list'
   | 'site.delete'
@@ -95,6 +97,7 @@ export async function callControlAgent(
           action === 'tunnel.route' ||
           action === 'site.create' ||
           action === 'db.create' ||
+          action === 'db.mutate' ||
           action === 'site.fixPermissions' ||
           action === 'files.chmod'
         ? 125_000

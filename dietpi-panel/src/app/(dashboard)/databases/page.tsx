@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
+import Link from 'next/link';
 import useSWR from 'swr';
 import { IconPlus, IconTrash } from '@/components/Icons';
 import { Modal } from '@/components/Modal';
@@ -184,7 +185,12 @@ export default function DatabasesPage() {
                 databases.map((db) => (
                   <tr key={db.name} className="hover:bg-elevated/40">
                     <td className="px-5 py-3.5 font-mono font-medium text-slate-100">
-                      <div>{db.name}</div>
+                      <Link
+                        href={`/databases/${encodeURIComponent(db.name)}`}
+                        className="hover:text-accent transition"
+                      >
+                        {db.name}
+                      </Link>
                       {me?.role === 'admin' && db.ownerUsername && (
                         <div className="mt-0.5 text-[11px] font-normal text-slate-500">
                           @{db.ownerUsername}
@@ -206,7 +212,13 @@ export default function DatabasesPage() {
                     <td className="px-5 py-3.5 font-mono text-xs text-slate-400">
                       {formatDateTime(db.modified)}
                     </td>
-                    <td className="px-5 py-3.5 text-right">
+                    <td className="px-5 py-3.5 text-right whitespace-nowrap space-x-2">
+                      <Link
+                        href={`/databases/${encodeURIComponent(db.name)}`}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-borderline bg-elevated px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-slate-500 transition"
+                      >
+                        <span>Manage</span>
+                      </Link>
                       <button
                         type="button"
                         onClick={() => {

@@ -67,6 +67,7 @@ const RESERVED_NAMES = new Set([
 const MUTATING_ACTIONS = new Set([
   'db.create',
   'db.delete',
+  'db.mutate',
   'site.create',
   'site.delete',
   'service.restart',
@@ -136,6 +137,8 @@ function sanitizeParamsForLog(action, params) {
       copy[k] = typeof v === 'string' ? `[REDACTED:${v.length}b]` : '[REDACTED]';
     } else if (k === 'repoUrl' && typeof v === 'string') {
       copy[k] = stripGitUrlCredentials(v).slice(0, 200);
+    } else if ((k === 'values' || k === 'rowKeys' || k === 'columns') && typeof v === 'object' && v !== null) {
+      copy[k] = Array.isArray(v) ? `[${v.length} items]` : `[${Object.keys(v).length} fields]`;
     } else if (typeof v === 'string' && v.length > 200) {
       copy[k] = `${v.slice(0, 200)}...`;
     } else {
@@ -2049,6 +2052,83 @@ function startPersistedWatchers() {
 }
 
 
+const DB_INSPECT_OPS = new Set(['schema', 'rows.list']);
+const DB_MUTATE_OPS = new Set([
+  'rows.insert',
+  'rows.update',
+  'rows.delete',
+  'table.create',
+  'table.drop',
+  'columns.add',
+  'columns.update',
+  'columns.drop',
+  'script.exec',
+]);
+
+async function runDbStudio(dbName, op, payload = {}) {
+  const name = validateName(dbName, 'database name');
+  const dbDir = `/srv/db/${name}`;
+  const dbPath = path.join(dbDir, 'data.sqlite');
+  if (!fs.existsSync(dbPath)) {
+    throw new Error(`Database "${name}" does not exist`);
+  }
+
+  const phpBin = findExecutable([
+    '/usr/bin/php',
+    '/usr/local/bin/php',
+    '/usr/bin/php8.4',
+    '/usr/bin/php8.3',
+    '/usr/bin/php8.2',
+  ]);
+  if (!phpBin) {
+    throw new Error('PHP CLI is required for database management');
+  }
+
+  const studioScript = findExecutable([
+    '/usr/local/lib/dietpi-panel/db-studio.php',
+    path.join(__dirname, 'db-studio.php'),
+    '/opt/control-agent/db-studio.php',
+  ]);
+  if (!studioScript) {
+    throw new Error('db-studio.php helper is not installed');
+  }
+
+  const stageDir = fs.mkdtempSync('/tmp/dp-sql-');
+  const reqPath = path.join(stageDir, 'req.json');
+  const { uid, gid } = getWwwDataIds();
+  try {
+    fs.chmodSync(stageDir, 0o700);
+    chownPathNoFollow(stageDir, uid, gid);
+    fs.writeFileSync(
+      reqPath,
+      JSON.stringify({ ...payload, op, dbPath }),
+      { mode: 0o600 }
+    );
+    chownPathNoFollow(reqPath, uid, gid);
+
+    const timeoutMs = op === 'script.exec' ? 120_000 : 30_000;
+    const step = await runAsWwwData(phpBin, [studioScript, reqPath], dbDir, timeoutMs);
+    const parsed = parseJsonSafe(step.stdout.trim());
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.ok) {
+        return { ok: true, stdout: JSON.stringify(parsed), stderr: '' };
+      }
+      return {
+        ok: false,
+        stdout: '',
+        stderr: parsed.error || step.stderr || 'Database operation failed',
+      };
+    }
+    return {
+      ok: false,
+      stdout: '',
+      stderr: step.stderr || step.stdout || 'Invalid response from database studio worker',
+    };
+  } finally {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+}
+
 async function handleAction(action, params = {}, socket = null) {
   if (params === null || typeof params !== 'object' || Array.isArray(params)) {
     throw new Error('params must be an object');
@@ -2076,6 +2156,22 @@ async function handleAction(action, params = {}, socket = null) {
     case 'db.list': {
       const res = await runBin('/usr/local/bin/listdb', []);
       return { ok: res.ok, stdout: res.stdout.trim() || '[]', stderr: res.stderr };
+    }
+
+    case 'db.inspect': {
+      const op = typeof params.op === 'string' ? params.op.trim() : '';
+      if (!DB_INSPECT_OPS.has(op)) {
+        throw new Error(`Unsupported db.inspect operation: ${op}`);
+      }
+      return runDbStudio(params.name, op, params);
+    }
+
+    case 'db.mutate': {
+      const op = typeof params.op === 'string' ? params.op.trim() : '';
+      if (!DB_MUTATE_OPS.has(op)) {
+        throw new Error(`Unsupported db.mutate operation: ${op}`);
+      }
+      return runDbStudio(params.name, op, params);
     }
 
     case 'db.delete': {

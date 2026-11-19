@@ -1,8 +1,20 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
-import { IconCheck, IconPlus, IconShield, IconTrash } from '@/components/Icons';
+import {
+  IconCheck,
+  IconCopy,
+  IconEdit,
+  IconEye,
+  IconPlus,
+  IconShield,
+  IconTrash,
+} from '@/components/Icons';
 import { Modal } from '@/components/Modal';
+import {
+  formatRawCellText,
+  tryFormatPrettyJson,
+} from '@/components/databases/exportUtils';
 import type {
   DbCellValue,
   DbColumnInfo,
@@ -337,7 +349,12 @@ export function ColumnEditorModal({
       setType(existingColumn.type || 'TEXT');
       setNotNull(existingColumn.notnull);
       setDefaultMode('keep');
-      setDefaultValue(existingColumn.defaultValue ?? '');
+      const rawDefault = existingColumn.defaultValue ?? '';
+      if (/^'(.*)'$/.test(rawDefault)) {
+        setDefaultValue(rawDefault.slice(1, -1).replace(/''/g, "'"));
+      } else {
+        setDefaultValue(rawDefault);
+      }
     } else {
       setName('');
       setType('TEXT');
@@ -840,6 +857,166 @@ export function ConfirmDbActionModal({
           </button>
         </div>
       </div>
+    </Modal>
+  );
+}
+
+export function RowInspectorModal({
+  open,
+  tableName,
+  columns,
+  row,
+  hasEditableKey,
+  onClose,
+  onEdit,
+}: {
+  open: boolean;
+  tableName: string;
+  columns: DbColumnInfo[];
+  row: DbRowItem | null;
+  hasEditableKey: boolean;
+  onClose: () => void;
+  onEdit: (row: DbRowItem) => void;
+}) {
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) setCopiedKey(null);
+  }, [open, row]);
+
+  const copyText = async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey(null), 1600);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
+
+  return (
+    <Modal
+      open={open}
+      title={`Inspect Row · ${tableName}`}
+      subtitle="Full unclipped field values and automatic JSON formatting."
+      onClose={onClose}
+      badge={<IconEye className="w-4 h-4 text-accent" />}
+      maxWidthClass="max-w-2xl"
+    >
+      {!row ? null : (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-mono text-[11px] text-slate-400">
+              {columns.length} field(s)
+            </span>
+            <button
+              type="button"
+              onClick={() => copyText('__all__', JSON.stringify(row.cells, null, 2))}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-borderline bg-elevated px-2.5 py-1 text-[11px] text-slate-200 hover:border-slate-500 transition"
+            >
+              {copiedKey === '__all__' ? (
+                <>
+                  <IconCheck className="w-3 h-3 text-emerald-400" />
+                  <span>Copied JSON</span>
+                </>
+              ) : (
+                <>
+                  <IconCopy className="w-3 h-3" />
+                  <span>Copy Row JSON</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          <div className="max-h-[58vh] overflow-y-auto space-y-2.5 pr-1">
+            {columns.map((col) => {
+              const val = row.cells[col.name] ?? null;
+              const isNull = val === null || val === undefined;
+              const isBlob = typeof val === 'object' && val !== null && '__blob' in val;
+              const prettyJson = isNull || isBlob ? null : tryFormatPrettyJson(val);
+              const rawText = formatRawCellText(val);
+
+              return (
+                <div
+                  key={col.name}
+                  className="rounded-lg border border-borderline bg-canvas p-3 space-y-1.5"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                      <span className="font-mono font-semibold text-slate-100">
+                        {col.name}
+                      </span>
+                      <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-slate-400">
+                        {col.type || 'ANY'}
+                      </span>
+                      {col.pk > 0 && (
+                        <span className="rounded bg-amber-500/15 px-1.5 py-0.5 font-mono text-[10px] text-amber-300">
+                          PK
+                        </span>
+                      )}
+                      {prettyJson && (
+                        <span className="rounded bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px] text-sky-300">
+                          JSON
+                        </span>
+                      )}
+                    </div>
+
+                    {!isNull && (
+                      <button
+                        type="button"
+                        onClick={() => copyText(col.name, prettyJson ?? rawText)}
+                        className="inline-flex items-center gap-1 rounded border border-borderline bg-surface px-2 py-0.5 text-[10px] text-slate-300 hover:text-white"
+                      >
+                        {copiedKey === col.name ? (
+                          <IconCheck className="w-3 h-3 text-emerald-400" />
+                        ) : (
+                          <IconCopy className="w-3 h-3" />
+                        )}
+                        <span>{copiedKey === col.name ? 'Copied' : 'Copy'}</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {isNull ? (
+                    <div className="font-mono text-xs italic text-slate-500">NULL</div>
+                  ) : isBlob ? (
+                    <div className="rounded bg-[#080b10] p-2 font-mono text-[11px] text-purple-300 break-all">
+                      [Binary BLOB · {(val as { bytes: number }).bytes} bytes]
+                    </div>
+                  ) : (
+                    <pre className="max-h-48 overflow-auto rounded bg-[#080b10] border border-borderline/60 p-2.5 font-mono text-[11px] text-slate-200 whitespace-pre-wrap break-words">
+                      {prettyJson ?? rawText}
+                    </pre>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex justify-end gap-2 pt-1">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs text-slate-300 hover:text-white"
+            >
+              Close
+            </button>
+            {hasEditableKey && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onEdit(row);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-slate-950 hover:bg-accent-hover"
+              >
+                <IconEdit className="w-3.5 h-3.5" />
+                <span>Edit Row</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </Modal>
   );
 }

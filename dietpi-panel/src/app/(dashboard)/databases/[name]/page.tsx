@@ -1,29 +1,30 @@
 'use client';
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import useSWR from 'swr';
 import {
-  IconDatabase,
+  IconColumns,
   IconPlus,
   IconRefresh,
-  IconSearch,
+  IconTable,
   IconTerminal,
-  IconTrash,
 } from '@/components/Icons';
 import { usePanel } from '@/components/PanelContext';
 import { StatusBadge } from '@/components/StatusBadge';
+import { DatabaseDataTab } from '@/components/databases/DatabaseDataTab';
 import {
   ColumnEditorModal,
   ConfirmDbActionModal,
   CreateTableModal,
   RowEditorModal,
+  RowInspectorModal,
 } from '@/components/databases/DatabaseModals';
-import {
-  DatabaseSqlTab,
-  formatDbCellDisplay,
-} from '@/components/databases/DatabaseSqlTab';
+import { DatabaseSidebar } from '@/components/databases/DatabaseSidebar';
+import { DatabaseSqlTab } from '@/components/databases/DatabaseSqlTab';
+import { DatabaseStructureTab } from '@/components/databases/DatabaseStructureTab';
 import { apiFetcher, apiMutate } from '@/lib/client-api';
+import { formatBytes } from '@/lib/format';
 import type {
   DbColumnInfo,
   DbRowItem,
@@ -43,6 +44,8 @@ type PendingConfirm =
   | { kind: 'dangerousSql'; sql: string; warnings: string[] }
   | null;
 
+const MAX_SQL_HISTORY = 8;
+
 export default function DatabaseStudioPage({
   params,
 }: {
@@ -50,8 +53,10 @@ export default function DatabaseStudioPage({
 }) {
   const dbName = decodeURIComponent(params.name);
   const { me } = usePanel();
+  const sqlHistoryKey = `dp_sql_hist_${dbName}`;
 
   const [tab, setTab] = useState<StudioTab>('data');
+  const [tablesCollapsed, setTablesCollapsed] = useState(false);
   const [tableFilter, setTableFilter] = useState('');
   const [selectedTable, setSelectedTable] = useState('');
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
@@ -68,6 +73,7 @@ export default function DatabaseStudioPage({
   // Modals & busy flags
   const [busy, setBusy] = useState(false);
   const [createTableOpen, setCreateTableOpen] = useState(false);
+  const [inspectRow, setInspectRow] = useState<DbRowItem | null>(null);
   const [rowModal, setRowModal] = useState<{
     open: boolean;
     mode: 'insert' | 'update';
@@ -81,10 +87,44 @@ export default function DatabaseStudioPage({
   const [confirmState, setConfirmState] = useState<PendingConfirm>(null);
 
   // SQL Runner state
-  const [sqlText, setSqlText] = useState('SELECT name, type FROM sqlite_master WHERE name NOT LIKE \'sqlite_%\';');
+  const [sqlText, setSqlText] = useState(
+    "SELECT name, type FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name;"
+  );
   const [useTransaction, setUseTransaction] = useState(true);
   const [sqlError, setSqlError] = useState<string | null>(null);
   const [sqlResult, setSqlResult] = useState<DbScriptResponse | null>(null);
+  const [sqlHistory, setSqlHistory] = useState<string[]>([]);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(sqlHistoryKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          setSqlHistory(parsed.filter((v): v is string => typeof v === 'string').slice(0, MAX_SQL_HISTORY));
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, [sqlHistoryKey]);
+
+  const recordSqlHistory = useCallback(
+    (sql: string) => {
+      const clean = sql.trim();
+      if (!clean) return;
+      setSqlHistory((prev) => {
+        const next = [clean, ...prev.filter((item) => item !== clean)].slice(0, MAX_SQL_HISTORY);
+        try {
+          window.localStorage.setItem(sqlHistoryKey, JSON.stringify(next));
+        } catch {
+          // ignore storage errors
+        }
+        return next;
+      });
+    },
+    [sqlHistoryKey]
+  );
 
   const manageUrl = `/api/databases/${encodeURIComponent(dbName)}/manage`;
 
@@ -118,6 +158,28 @@ export default function DatabaseStudioPage({
     [tables, selectedTable]
   );
 
+  // Reset stale sortBy if column was dropped or renamed
+  useEffect(() => {
+    if (
+      activeTableInfo &&
+      sortBy &&
+      !activeTableInfo.columns.some((c) => c.name === sortBy)
+    ) {
+      setSortBy('');
+    }
+  }, [activeTableInfo, sortBy]);
+
+  // Debounce live table search nicely without manual Enter requirement
+  useEffect(() => {
+    const trimmed = searchInput.trim();
+    if (trimmed === appliedSearch) return;
+    const timer = window.setTimeout(() => {
+      setPage(1);
+      setAppliedSearch(trimmed);
+    }, 320);
+    return () => window.clearTimeout(timer);
+  }, [searchInput, appliedSearch]);
+
   const rowsUrl =
     selectedTable && tab === 'data'
       ? `${manageUrl}?action=rows&table=${encodeURIComponent(selectedTable)}&page=${page}&pageSize=${pageSize}&search=${encodeURIComponent(appliedSearch)}&sortBy=${encodeURIComponent(sortBy)}&sortDir=${sortDir}`
@@ -132,42 +194,55 @@ export default function DatabaseStudioPage({
     keepPreviousData: true,
   });
 
+  const rowsMatchesTable = Boolean(rowsData && rowsData.table === selectedTable);
+  const totalRows = rowsMatchesTable ? (rowsData?.totalRows ?? 0) : (activeTableInfo?.rowCount ?? 0);
+  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+
+  // Clamp page cleanly if deleting rows shrunk totalPages below current page
+  useEffect(() => {
+    if (rowsMatchesTable && page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [rowsMatchesTable, page, totalPages]);
+
   const filteredTables = useMemo(() => {
     const q = tableFilter.trim().toLowerCase();
     if (!q) return tables;
     return tables.filter((t) => t.name.toLowerCase().includes(q));
   }, [tables, tableFilter]);
 
-  const selectTable = (tName: string) => {
-    setSelectedTable(tName);
-    setPage(1);
-    setSearchInput('');
-    setAppliedSearch('');
-    setSortBy('');
-    setSortDir('ASC');
-    setSelectedRowKeys({});
-  };
-
-  const refreshAll = async () => {
-    await Promise.all([mutateSchema(), rowsUrl ? mutateRows() : Promise.resolve()]);
-  };
-
-  const toggleSort = (colName: string) => {
-    if (sortBy === colName) {
-      setSortDir((d) => (d === 'ASC' ? 'DESC' : 'ASC'));
-    } else {
-      setSortBy(colName);
+  const selectTable = useCallback(
+    (tName: string) => {
+      setSelectedTable(tName);
+      setPage(1);
+      setSearchInput('');
+      setAppliedSearch('');
+      setSortBy('');
       setSortDir('ASC');
-    }
-    setPage(1);
-  };
-
-  const selectedKeysList = useMemo(
-    () => Object.values(selectedRowKeys),
-    [selectedRowKeys]
+      setSelectedRowKeys({});
+      if (tab === 'sql') setTab('data');
+    },
+    [tab]
   );
 
-  const toggleRowCheck = (keyObj: DbRowKey) => {
+  const refreshAll = useCallback(async () => {
+    await Promise.all([mutateSchema(), rowsUrl ? mutateRows() : Promise.resolve()]);
+  }, [mutateSchema, mutateRows, rowsUrl]);
+
+  const toggleSort = useCallback(
+    (colName: string) => {
+      if (sortBy === colName) {
+        setSortDir((d) => (d === 'ASC' ? 'DESC' : 'ASC'));
+      } else {
+        setSortBy(colName);
+        setSortDir('ASC');
+      }
+      setPage(1);
+    },
+    [sortBy]
+  );
+
+  const toggleRowCheck = useCallback((keyObj: DbRowKey) => {
     const id = JSON.stringify(keyObj);
     setSelectedRowKeys((prev) => {
       const next = { ...prev };
@@ -175,7 +250,22 @@ export default function DatabaseStudioPage({
       else next[id] = keyObj;
       return next;
     });
-  };
+  }, []);
+
+  const handleToggleAllPageRows = useCallback(
+    (checked: boolean) => {
+      if (!checked || !rowsData || rowsData.table !== selectedTable) {
+        setSelectedRowKeys({});
+        return;
+      }
+      const next: Record<string, DbRowKey> = {};
+      for (const r of rowsData.rows) {
+        if (r.rowKey) next[JSON.stringify(r.rowKey)] = r.rowKey;
+      }
+      setSelectedRowKeys(next);
+    },
+    [rowsData, selectedTable]
+  );
 
   const handleSaveRow = async (
     values: Record<string, { isNull?: boolean; value?: string; valueType?: string }>
@@ -268,6 +358,10 @@ export default function DatabaseStudioPage({
       });
       setCreateTableOpen(false);
       setSelectedTable(payload.tableName);
+      setPage(1);
+      setSearchInput('');
+      setAppliedSearch('');
+      setSortBy('');
       setTab('data');
       setBanner({ ok: true, text: `Created table "${payload.tableName}".` });
       await mutateSchema();
@@ -303,6 +397,7 @@ export default function DatabaseStudioPage({
         });
         return;
       }
+      recordSqlHistory(sqlText);
       setSqlResult(res.result);
       setConfirmState(null);
       setBanner({
@@ -332,6 +427,7 @@ export default function DatabaseStudioPage({
         });
         if (selectedTable === confirmState.table.name) {
           setSelectedTable('');
+          setSelectedRowKeys({});
         }
         setConfirmState(null);
         await mutateSchema();
@@ -370,10 +466,9 @@ export default function DatabaseStudioPage({
     }
   };
 
-  const totalRows = rowsData?.totalRows ?? 0;
-  const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-  const currentCols = rowsData?.columns ?? activeTableInfo?.columns ?? [];
-  const rowsList = rowsData?.rows ?? [];
+  const currentCols =
+    activeTableInfo?.columns ?? (rowsMatchesTable ? rowsData?.columns : undefined) ?? [];
+  const rowsList = rowsMatchesTable ? (rowsData?.rows ?? []) : [];
   const hasSingleIntPk = (activeTableInfo?.primaryKey.length ?? 0) === 1;
 
   return (
@@ -388,20 +483,26 @@ export default function DatabaseStudioPage({
             <span>/</span>
             <span className="font-mono text-slate-200">{dbName}</span>
           </div>
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-2xl font-semibold tracking-tight font-mono text-slate-100">
               {dbName}
             </h1>
             {schemaData?.sqliteVersion && (
               <StatusBadge tone="blue" label={`SQLite ${schemaData.sqliteVersion}`} />
             )}
+            {schemaData?.journalMode && (
+              <StatusBadge tone="green" label={schemaData.journalMode} />
+            )}
             <StatusBadge
               tone="slate"
-              label={`${tables.length} ${tables.length === 1 ? 'table' : 'tables'}`}
+              label={`${tables.length} ${tables.length === 1 ? 'object' : 'objects'}`}
             />
+            {typeof schemaData?.dbSizeBytes === 'number' && (
+              <StatusBadge tone="slate" label={formatBytes(schemaData.dbSizeBytes)} />
+            )}
           </div>
           <p className="mt-1 text-xs font-mono text-slate-400">
-            /srv/db/{dbName}/data.sqlite · Managed safely via PDO SQLite (WAL) as www-data
+            /srv/db/{dbName}/data.sqlite · Managed via PDO SQLite as www-data
           </p>
         </div>
 
@@ -454,131 +555,78 @@ export default function DatabaseStudioPage({
 
       {schemaError ? (
         <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-5 py-4 text-sm text-rose-200 flex flex-wrap items-center justify-between gap-3">
-          <span>{schemaError.message}</span>
+          <span className="break-all">{schemaError.message}</span>
           <Link
             href="/databases"
-            className="rounded-lg border border-borderline bg-surface px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-slate-500"
+            className="rounded-lg border border-borderline bg-surface px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-slate-500 shrink-0"
           >
             Back to Databases
           </Link>
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-          {/* Left: Tables Sidebar */}
-          <aside className="lg:col-span-3 rounded-xl border border-borderline bg-surface overflow-hidden flex flex-col self-start">
-            <div className="flex items-center justify-between border-b border-borderline bg-canvas/50 px-4 py-3">
-              <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
-                <IconDatabase className="w-3.5 h-3.5 text-accent" />
-                <span>Tables &amp; Views</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setCreateTableOpen(true)}
-                className="rounded border border-borderline bg-elevated px-2 py-0.5 text-[11px] text-slate-200 hover:border-slate-500"
-              >
-                + Table
-              </button>
-            </div>
+        <div className="flex flex-col lg:flex-row gap-5 items-start">
+          {/* Collapsible Tables Explorer */}
+          <DatabaseSidebar
+            tables={tables}
+            filteredTables={filteredTables}
+            selectedTable={selectedTable}
+            tableFilter={tableFilter}
+            collapsed={tablesCollapsed}
+            onToggleCollapse={() => setTablesCollapsed((c) => !c)}
+            onChangeFilter={setTableFilter}
+            onSelectTable={selectTable}
+            onCreateTable={() => setCreateTableOpen(true)}
+            onDropTable={(t) => setConfirmState({ kind: 'dropTable', table: t })}
+          />
 
-            {tables.length > 5 && (
-              <div className="border-b border-borderline bg-canvas/30 px-3 py-2">
-                <div className="relative">
-                  <IconSearch className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                  <input
-                    type="search"
-                    placeholder="Filter tables..."
-                    value={tableFilter}
-                    onChange={(e) => setTableFilter(e.target.value)}
-                    className="w-full rounded-md border border-borderline bg-canvas pl-8 pr-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
-                  />
-                </div>
-              </div>
-            )}
-
-            <div className="divide-y divide-borderline max-h-[60vh] overflow-y-auto">
-              {filteredTables.length === 0 ? (
-                <div className="px-4 py-8 text-center text-xs text-slate-500">
-                  {tables.length === 0
-                    ? 'Empty database — create a table or run a SQL script.'
-                    : 'No tables match filter.'}
-                </div>
-              ) : (
-                filteredTables.map((t) => {
-                  const active = selectedTable === t.name;
-                  return (
-                    <div
-                      key={t.name}
-                      className={`flex items-center justify-between gap-2 px-3.5 py-2.5 transition ${
-                        active ? 'bg-accent/10 border-l-2 border-l-accent' : 'hover:bg-elevated/40'
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          selectTable(t.name);
-                          if (tab === 'sql') setTab('data');
-                        }}
-                        className="min-w-0 flex-1 text-left"
-                      >
-                        <div className="flex items-center gap-1.5">
-                          <span className="truncate font-mono text-xs font-medium text-slate-100">
-                            {t.name}
-                          </span>
-                          {t.type === 'view' && (
-                            <span className="rounded bg-sky-500/15 px-1 text-[9px] font-mono text-sky-300 uppercase">
-                              view
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-[11px] font-mono text-slate-500">
-                          {t.rowCount} row(s) · {t.columns.length} col(s)
-                        </div>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => setConfirmState({ kind: 'dropTable', table: t })}
-                        title={`Drop ${t.type} ${t.name}`}
-                        className="rounded p-1 text-slate-500 hover:bg-rose-500/15 hover:text-rose-400 shrink-0"
-                      >
-                        <IconTrash className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </aside>
-
-          {/* Right: Main Workspace */}
-          <div className="lg:col-span-9 space-y-4 min-w-0">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-borderline pb-3">
-              <div className="flex items-center gap-2">
-                {(
-                  [
-                    { id: 'data', label: 'Rows & Data' },
-                    { id: 'structure', label: 'Columns & Structure' },
-                    { id: 'sql', label: 'SQL Script Runner' },
-                  ] as const
-                ).map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => setTab(item.id)}
-                    className={`rounded-lg px-3.5 py-1.5 text-xs font-medium transition ${
-                      tab === item.id
-                        ? 'bg-accent/15 text-accent border border-accent/40'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {item.label}
-                  </button>
-                ))}
+          {/* Main Studio Workspace */}
+          <div className="flex-1 w-full min-w-0 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-borderline bg-surface/70 px-3 py-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setTab('data')}
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+                    tab === 'data'
+                      ? 'bg-accent/15 text-accent border border-accent/40'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-elevated/60 border border-transparent'
+                  }`}
+                >
+                  <IconTable className="w-3.5 h-3.5" />
+                  <span>Rows &amp; Data</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTab('structure')}
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+                    tab === 'structure'
+                      ? 'bg-accent/15 text-accent border border-accent/40'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-elevated/60 border border-transparent'
+                  }`}
+                >
+                  <IconColumns className="w-3.5 h-3.5" />
+                  <span>Columns &amp; Structure</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTab('sql')}
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+                    tab === 'sql'
+                      ? 'bg-accent/15 text-accent border border-accent/40'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-elevated/60 border border-transparent'
+                  }`}
+                >
+                  <IconTerminal className="w-3.5 h-3.5" />
+                  <span>SQL Script Workbench</span>
+                </button>
               </div>
 
               {activeTableInfo && tab !== 'sql' && (
-                <div className="font-mono text-xs text-slate-400">
-                  Selected: <span className="text-slate-100">{activeTableInfo.name}</span>
+                <div className="flex items-center gap-2 font-mono text-xs text-slate-400 px-1">
+                  <span>Active:</span>
+                  <span className="rounded bg-canvas px-2 py-0.5 text-slate-100 border border-borderline">
+                    {activeTableInfo.name}
+                  </span>
                 </div>
               )}
             </div>
@@ -591,8 +639,17 @@ export default function DatabaseStudioPage({
                 busy={busy}
                 scriptError={sqlError}
                 scriptResult={sqlResult}
+                history={sqlHistory}
                 onChangeSql={setSqlText}
                 onChangeUseTransaction={setUseTransaction}
+                onClearHistory={() => {
+                  setSqlHistory([]);
+                  try {
+                    window.localStorage.removeItem(sqlHistoryKey);
+                  } catch {
+                    // ignore
+                  }
+                }}
                 onExecute={() => void executeSqlScript(false)}
               />
             ) : !activeTableInfo ? (
@@ -611,396 +668,87 @@ export default function DatabaseStudioPage({
                     onClick={() => setTab('sql')}
                     className="rounded-lg border border-borderline bg-elevated px-4 py-2 text-xs text-slate-200 hover:border-slate-500"
                   >
-                    Open SQL Script Runner
+                    Open SQL Script Workbench
                   </button>
                 </div>
               </div>
             ) : tab === 'data' ? (
-              <section className="rounded-xl border border-borderline bg-surface overflow-hidden">
-                {/* Data Toolbar */}
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-borderline bg-canvas/50 px-4 py-3">
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      setPage(1);
-                      setAppliedSearch(searchInput.trim());
-                    }}
-                    className="flex flex-wrap items-center gap-2 flex-1 min-w-[220px]"
-                  >
-                    <div className="relative flex-1 max-w-xs">
-                      <IconSearch className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                      <input
-                        type="search"
-                        placeholder="Search any column..."
-                        value={searchInput}
-                        onChange={(e) => setSearchInput(e.target.value)}
-                        className="w-full rounded-lg border border-borderline bg-canvas pl-8 pr-3 py-1.5 text-xs text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none"
-                      />
-                    </div>
-                    <button
-                      type="submit"
-                      className="rounded-lg border border-borderline bg-elevated px-3 py-1.5 text-xs text-slate-200 hover:border-slate-500"
-                    >
-                      Filter
-                    </button>
-                    {appliedSearch && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSearchInput('');
-                          setAppliedSearch('');
-                          setPage(1);
-                        }}
-                        className="text-xs text-slate-400 hover:text-slate-200"
-                      >
-                        Clear
-                      </button>
-                    )}
-                  </form>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    {activeTableInfo.type === 'table' && selectedKeysList.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setConfirmState({
-                            kind: 'deleteRows',
-                            table: activeTableInfo.name,
-                            rowKeys: selectedKeysList,
-                          })
-                        }
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-200 hover:bg-rose-500/20"
-                      >
-                        <IconTrash className="w-3.5 h-3.5" />
-                        <span>Delete Selected ({selectedKeysList.length})</span>
-                      </button>
-                    )}
-                    {activeTableInfo.type === 'table' && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setRowModal({ open: true, mode: 'insert', row: null })
-                        }
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-accent-hover"
-                      >
-                        <IconPlus className="w-3.5 h-3.5" />
-                        <span>Add Row</span>
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {rowsError && (
-                  <div className="border-b border-rose-500/40 bg-rose-500/10 px-4 py-2.5 text-xs text-rose-200">
-                    {rowsError.message}
-                  </div>
-                )}
-
-                <div className="overflow-x-auto max-h-[58vh]">
-                  <table className="w-full text-left text-xs">
-                    <thead className="border-b border-borderline bg-canvas/40 font-mono text-[11px] text-slate-400 sticky top-0">
-                      <tr>
-                        {activeTableInfo.hasEditableKey && (
-                          <th className="px-3 py-2.5 w-8">
-                            <input
-                              type="checkbox"
-                              checked={
-                                rowsList.length > 0 &&
-                                rowsList.every(
-                                  (r) =>
-                                    r.rowKey &&
-                                    Boolean(selectedRowKeys[JSON.stringify(r.rowKey)])
-                                )
-                              }
-                              onChange={(e) => {
-                                if (!e.target.checked) {
-                                  setSelectedRowKeys({});
-                                } else {
-                                  const next: Record<string, DbRowKey> = {};
-                                  for (const r of rowsList) {
-                                    if (r.rowKey) next[JSON.stringify(r.rowKey)] = r.rowKey;
-                                  }
-                                  setSelectedRowKeys(next);
-                                }
-                              }}
-                              className="rounded border-borderline bg-canvas text-accent"
-                            />
-                          </th>
-                        )}
-                        {currentCols.map((c) => (
-                          <th key={c.name} className="px-3.5 py-2.5 font-medium whitespace-nowrap">
-                            <button
-                              type="button"
-                              onClick={() => toggleSort(c.name)}
-                              className="inline-flex items-center gap-1 hover:text-slate-100"
-                            >
-                              <span>{c.name}</span>
-                              {c.pk > 0 && <span className="text-amber-400">*</span>}
-                              {sortBy === c.name && (
-                                <span className="text-accent">
-                                  {sortDir === 'ASC' ? '↑' : '↓'}
-                                </span>
-                              )}
-                            </button>
-                          </th>
-                        ))}
-                        {activeTableInfo.hasEditableKey && (
-                          <th className="px-3.5 py-2.5 text-right whitespace-nowrap">
-                            Actions
-                          </th>
-                        )}
-                      </tr>
-                    </thead>
-
-                    <tbody className="divide-y divide-borderline font-mono">
-                      {rowsList.length === 0 ? (
-                        <tr>
-                          <td
-                            colSpan={
-                              currentCols.length + (activeTableInfo.hasEditableKey ? 2 : 0)
-                            }
-                            className="px-5 py-10 text-center font-sans text-xs text-slate-500"
-                          >
-                            {loadingRows ? 'Loading rows...' : 'No rows found.'}
-                          </td>
-                        </tr>
-                      ) : (
-                        rowsList.map((row, rIdx) => {
-                          const rkStr = row.rowKey ? JSON.stringify(row.rowKey) : String(rIdx);
-                          const isChecked = row.rowKey ? Boolean(selectedRowKeys[rkStr]) : false;
-                          return (
-                            <tr
-                              key={rkStr}
-                              className={`hover:bg-elevated/35 ${isChecked ? 'bg-accent/5' : ''}`}
-                            >
-                              {activeTableInfo.hasEditableKey && (
-                                <td className="px-3 py-2">
-                                  {row.rowKey && (
-                                    <input
-                                      type="checkbox"
-                                      checked={isChecked}
-                                      onChange={() => row.rowKey && toggleRowCheck(row.rowKey)}
-                                      className="rounded border-borderline bg-canvas text-accent"
-                                    />
-                                  )}
-                                </td>
-                              )}
-                              {currentCols.map((c) => {
-                                const disp = formatDbCellDisplay(row.cells[c.name] ?? null);
-                                return (
-                                  <td
-                                    key={c.name}
-                                    className={`px-3.5 py-2 max-w-[260px] truncate ${
-                                      disp.isNull
-                                        ? 'italic text-slate-500'
-                                        : disp.isBlob
-                                          ? 'text-purple-300'
-                                          : 'text-slate-200'
-                                    }`}
-                                    title={disp.text}
-                                  >
-                                    {disp.text}
-                                  </td>
-                                );
-                              })}
-                              {activeTableInfo.hasEditableKey && (
-                                <td className="px-3.5 py-2 text-right whitespace-nowrap space-x-2">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setRowModal({ open: true, mode: 'update', row })
-                                    }
-                                    className="rounded border border-borderline bg-elevated px-2 py-0.5 text-[11px] font-sans text-slate-200 hover:border-slate-500"
-                                  >
-                                    Edit
-                                  </button>
-                                  {row.rowKey && (
-                                    <button
-                                      type="button"
-                                      onClick={() =>
-                                        row.rowKey &&
-                                        setConfirmState({
-                                          kind: 'deleteRows',
-                                          table: activeTableInfo.name,
-                                          rowKeys: [row.rowKey],
-                                        })
-                                      }
-                                      className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-[11px] font-sans text-rose-300 hover:bg-rose-500/20"
-                                    >
-                                      Delete
-                                    </button>
-                                  )}
-                                </td>
-                              )}
-                            </tr>
-                          );
-                        })
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-
-                {/* Pagination Bar */}
-                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-borderline bg-canvas/50 px-4 py-2.5 text-xs text-slate-400">
-                  <div>
-                    Total: <span className="font-mono text-slate-200">{totalRows}</span> row(s) ·
-                    Page <span className="font-mono text-slate-200">{page}</span> of{' '}
-                    <span className="font-mono text-slate-200">{totalPages}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={pageSize}
-                      onChange={(e) => {
-                        setPageSize(Number.parseInt(e.target.value, 10));
-                        setPage(1);
-                      }}
-                      className="rounded-md border border-borderline bg-canvas px-2 py-1 text-xs text-slate-200"
-                    >
-                      {[25, 50, 100, 200].map((ps) => (
-                        <option key={ps} value={ps}>
-                          {ps} / page
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      disabled={page <= 1}
-                      onClick={() => setPage((p) => Math.max(1, p - 1))}
-                      className="rounded-md border border-borderline bg-elevated px-2.5 py-1 text-xs text-slate-200 disabled:opacity-40"
-                    >
-                      Prev
-                    </button>
-                    <button
-                      type="button"
-                      disabled={page >= totalPages}
-                      onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                      className="rounded-md border border-borderline bg-elevated px-2.5 py-1 text-xs text-slate-200 disabled:opacity-40"
-                    >
-                      Next
-                    </button>
-                  </div>
-                </div>
-              </section>
+              <DatabaseDataTab
+                tableInfo={activeTableInfo}
+                columns={currentCols}
+                rows={rowsList}
+                rowsMatchesTable={rowsMatchesTable}
+                loadingRows={loadingRows}
+                rowsError={rowsError ? rowsError.message : null}
+                searchInput={searchInput}
+                appliedSearch={appliedSearch}
+                sortBy={sortBy}
+                sortDir={sortDir}
+                page={page}
+                pageSize={pageSize}
+                totalRows={totalRows}
+                totalPages={totalPages}
+                selectedRowKeys={selectedRowKeys}
+                onChangeSearchInput={setSearchInput}
+                onApplySearch={() => {
+                  setPage(1);
+                  setAppliedSearch(searchInput.trim());
+                }}
+                onClearSearch={() => {
+                  setSearchInput('');
+                  setAppliedSearch('');
+                  setPage(1);
+                }}
+                onToggleSort={toggleSort}
+                onToggleRowCheck={toggleRowCheck}
+                onToggleAllPageRows={handleToggleAllPageRows}
+                onOpenInsertRow={() => setRowModal({ open: true, mode: 'insert', row: null })}
+                onOpenInspectRow={(r) => setInspectRow(r)}
+                onOpenEditRow={(r) => setRowModal({ open: true, mode: 'update', row: r })}
+                onRequestDeleteRows={(rowKeys) =>
+                  setConfirmState({
+                    kind: 'deleteRows',
+                    table: activeTableInfo.name,
+                    rowKeys,
+                  })
+                }
+                onChangePage={setPage}
+                onChangePageSize={(nextSize) => {
+                  setPageSize(nextSize);
+                  setPage(1);
+                }}
+              />
             ) : (
-              /* Structure & Columns Tab */
-              <div className="space-y-4">
-                <section className="rounded-xl border border-borderline bg-surface overflow-hidden">
-                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-borderline px-5 py-3.5">
-                    <div>
-                      <h2 className="text-sm font-semibold text-slate-100">
-                        Columns ({activeTableInfo.columns.length})
-                      </h2>
-                      <p className="text-xs text-slate-400">
-                        Add, rename, re-type, or drop columns on{' '}
-                        <span className="font-mono">{activeTableInfo.name}</span>.
-                      </p>
-                    </div>
-                    {activeTableInfo.type === 'table' && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setColModal({ open: true, mode: 'add', column: null })
-                        }
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-semibold text-slate-950 hover:bg-accent-hover"
-                      >
-                        <IconPlus className="w-3.5 h-3.5" />
-                        <span>Add Column</span>
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left text-xs">
-                      <thead className="border-b border-borderline bg-canvas/50 uppercase text-[11px] text-slate-400">
-                        <tr>
-                          <th className="px-4 py-2.5 font-medium">#</th>
-                          <th className="px-4 py-2.5 font-medium">Column</th>
-                          <th className="px-4 py-2.5 font-medium">Type</th>
-                          <th className="px-4 py-2.5 font-medium">Constraints</th>
-                          <th className="px-4 py-2.5 font-medium">Default</th>
-                          {activeTableInfo.type === 'table' && (
-                            <th className="px-4 py-2.5 font-medium text-right">Actions</th>
-                          )}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-borderline font-mono">
-                        {activeTableInfo.columns.map((col) => (
-                          <tr key={col.name} className="hover:bg-elevated/35">
-                            <td className="px-4 py-2.5 text-slate-500">{col.cid}</td>
-                            <td className="px-4 py-2.5 font-semibold text-slate-100">
-                              {col.name}
-                            </td>
-                            <td className="px-4 py-2.5 text-sky-300">
-                              {col.type || 'ANY'}
-                            </td>
-                            <td className="px-4 py-2.5">
-                              <div className="flex flex-wrap gap-1.5 font-sans">
-                                {col.pk > 0 && (
-                                  <StatusBadge tone="amber" label={`PK #${col.pk}`} />
-                                )}
-                                {col.notnull ? (
-                                  <StatusBadge tone="blue" label="NOT NULL" />
-                                ) : (
-                                  <StatusBadge tone="slate" label="Nullable" />
-                                )}
-                              </div>
-                            </td>
-                            <td className="px-4 py-2.5 text-slate-300">
-                              {col.defaultValue ?? <span className="text-slate-600">—</span>}
-                            </td>
-                            {activeTableInfo.type === 'table' && (
-                              <td className="px-4 py-2.5 text-right whitespace-nowrap space-x-2 font-sans">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setColModal({ open: true, mode: 'update', column: col })
-                                  }
-                                  className="rounded border border-borderline bg-elevated px-2.5 py-1 text-[11px] text-slate-200 hover:border-slate-500"
-                                >
-                                  Edit
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={
-                                    col.pk > 0 || activeTableInfo.columns.length <= 1
-                                  }
-                                  onClick={() =>
-                                    setConfirmState({
-                                      kind: 'dropColumn',
-                                      table: activeTableInfo.name,
-                                      column: col.name,
-                                    })
-                                  }
-                                  className="rounded border border-rose-500/30 bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/20 disabled:opacity-30"
-                                >
-                                  Drop
-                                </button>
-                              </td>
-                            )}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </section>
-
-                {activeTableInfo.sql && (
-                  <section className="rounded-xl border border-borderline bg-surface p-4 space-y-2">
-                    <div className="text-xs font-semibold text-slate-300">
-                      DDL Definition
-                    </div>
-                    <pre className="overflow-x-auto rounded-lg border border-borderline bg-[#080b10] p-3 font-mono text-[11px] text-slate-300 whitespace-pre-wrap">
-                      {activeTableInfo.sql}
-                    </pre>
-                  </section>
-                )}
-              </div>
+              <DatabaseStructureTab
+                tableInfo={activeTableInfo}
+                onAddColumn={() => setColModal({ open: true, mode: 'add', column: null })}
+                onEditColumn={(col) =>
+                  setColModal({ open: true, mode: 'update', column: col })
+                }
+                onDropColumn={(colName) =>
+                  setConfirmState({
+                    kind: 'dropColumn',
+                    table: activeTableInfo.name,
+                    column: colName,
+                  })
+                }
+              />
             )}
           </div>
         </div>
       )}
 
       {/* Modals */}
+      <RowInspectorModal
+        open={Boolean(inspectRow)}
+        tableName={selectedTable}
+        columns={currentCols}
+        row={inspectRow}
+        hasEditableKey={Boolean(activeTableInfo?.hasEditableKey)}
+        onClose={() => setInspectRow(null)}
+        onEdit={(r) => setRowModal({ open: true, mode: 'update', row: r })}
+      />
+
       <RowEditorModal
         open={rowModal.open}
         mode={rowModal.mode}

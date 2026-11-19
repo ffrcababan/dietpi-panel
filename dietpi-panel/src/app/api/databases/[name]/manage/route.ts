@@ -35,6 +35,11 @@ export interface DbForeignKeyInfo {
   onDelete: string;
 }
 
+export interface DbTriggerInfo {
+  name: string;
+  sql: string;
+}
+
 export interface DbTableInfo {
   name: string;
   type: 'table' | 'view';
@@ -46,11 +51,14 @@ export interface DbTableInfo {
   columns: DbColumnInfo[];
   indexes: DbIndexInfo[];
   foreignKeys: DbForeignKeyInfo[];
+  triggers?: DbTriggerInfo[];
 }
 
 export interface DbSchemaResponse {
   ok: boolean;
   sqliteVersion: string;
+  journalMode?: string;
+  dbSizeBytes?: number;
   tables: DbTableInfo[];
 }
 

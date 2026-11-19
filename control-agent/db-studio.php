@@ -215,6 +215,26 @@ function getRowIdAlias(PDO $pdo, string $tableName, array $columns, ?string $tab
 function handleSchema(PDO $pdo, array $req): array
 {
     $version = (string)$pdo->query('SELECT sqlite_version()')->fetchColumn();
+    $journalMode = strtoupper((string)$pdo->query('PRAGMA journal_mode')->fetchColumn());
+    $dbPath = is_string($req['dbPath'] ?? null) ? $req['dbPath'] : '';
+    $mainSize = $dbPath !== '' && is_file($dbPath) ? (int)(@filesize($dbPath) ?: 0) : 0;
+    $walSize = $dbPath !== '' && is_file($dbPath . '-wal') ? (int)(@filesize($dbPath . '-wal') ?: 0) : 0;
+    $dbSizeBytes = $mainSize + $walSize;
+
+    $allTriggers = $pdo->query(
+        "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' ORDER BY name ASC"
+    )->fetchAll();
+    $triggersByTable = [];
+    foreach ($allTriggers as $trg) {
+        $tbl = (string)($trg['tbl_name'] ?? '');
+        if ($tbl !== '') {
+            $triggersByTable[$tbl][] = [
+                'name' => (string)$trg['name'],
+                'sql' => (string)($trg['sql'] ?? ''),
+            ];
+        }
+    }
+
     $objs = $pdo->query(
         "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY CASE WHEN type = 'table' THEN 0 ELSE 1 END, name ASC"
     )->fetchAll();
@@ -282,12 +302,15 @@ function handleSchema(PDO $pdo, array $req): array
             'columns' => $cols,
             'indexes' => $indexes,
             'foreignKeys' => $fks,
+            'triggers' => $triggersByTable[$tName] ?? [],
         ];
     }
 
     return [
         'ok' => true,
         'sqliteVersion' => $version,
+        'journalMode' => $journalMode,
+        'dbSizeBytes' => $dbSizeBytes,
         'tables' => $tables,
     ];
 }

@@ -1,5 +1,9 @@
 import { NextResponse } from 'next/server';
-import { callControlAgent, parseAgentJson } from '@/lib/agent';
+import {
+  callControlAgent,
+  parseAgentJson,
+  type TunnelActionResult,
+} from '@/lib/agent';
 import { requireAdmin } from '@/lib/auth';
 import { validateResourceName } from '@/lib/validation';
 
@@ -19,6 +23,7 @@ export interface CreateDatabaseResult {
   dbPath: string;
   apiKey: string;
   vhost: string;
+  tunnel?: TunnelActionResult;
 }
 
 export async function GET() {

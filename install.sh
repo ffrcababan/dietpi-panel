@@ -142,9 +142,25 @@ if [[ ${#SESSION_SECRET} -lt 32 ]]; then
     SESSION_SECRET="$(openssl rand -hex 32)"
 fi
 
-cat > /etc/control-agent/config.env <<EOF
+if [[ -f /etc/control-agent/config.env ]]; then
+    if grep -q '^BASE_DOMAIN=' /etc/control-agent/config.env; then
+        sed -i "s|^BASE_DOMAIN=.*$|BASE_DOMAIN=${TARGET_DOMAIN}|" /etc/control-agent/config.env
+    else
+        printf 'BASE_DOMAIN=%s\n' "${TARGET_DOMAIN}" >> /etc/control-agent/config.env
+    fi
+else
+    cat > /etc/control-agent/config.env <<EOF
 BASE_DOMAIN=${TARGET_DOMAIN}
+# Optional Cloudflare Tunnel (cloudflared) integration:
+# Enabled automatically when cloudflared and /etc/cloudflared/config.yml exist.
+# CF_ENABLED=auto
+# CF_TUNNEL_NAME=dietpipanel
+# CF_CONFIG=/etc/cloudflared/config.yml
+# CF_SERVICE_URL=http://localhost:80
+# CF_UNIT=cloudflared
+# TUNNEL_ORIGIN_CERT=/root/.cloudflared/cert.pem
 EOF
+fi
 chown root:root /etc/control-agent/config.env
 chmod 0644 /etc/control-agent/config.env
 

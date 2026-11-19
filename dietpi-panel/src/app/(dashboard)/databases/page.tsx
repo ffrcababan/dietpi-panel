@@ -12,7 +12,8 @@ import { Modal } from '@/components/Modal';
 import { usePanel } from '@/components/PanelContext';
 import { StatusBadge } from '@/components/StatusBadge';
 import { apiFetcher, apiMutate } from '@/lib/client-api';
-import { formatBytes, formatDateTime } from '@/lib/format';
+import type { TunnelActionResult } from '@/lib/agent';
+import { formatBytes, formatDateTime, formatTunnelSummary } from '@/lib/format';
 import { NAME_RE, RESERVED_NAMES } from '@/lib/validation';
 import type {
   CreateDatabaseResult,
@@ -39,6 +40,9 @@ export default function DatabasesPage() {
   const [confirmName, setConfirmName] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [tunnelBanner, setTunnelBanner] = useState<{ ok: boolean; text: string } | null>(
+    null
+  );
 
   const databases = data?.databases ?? [];
   const baseDomain = me?.baseDomain || 'mydomain.com';
@@ -87,14 +91,19 @@ export default function DatabasesPage() {
 
     setDeleting(true);
     setDeleteError(null);
+    setTunnelBanner(null);
     try {
-      await apiMutate(
+      const res = await apiMutate<{
+        deleted: { tunnel?: TunnelActionResult };
+      }>(
         `/api/databases/${encodeURIComponent(deleteTarget.name)}`,
         'DELETE',
         me.csrfToken
       );
       setDeleteTarget(null);
       setConfirmName('');
+      const summary = formatTunnelSummary(res.deleted?.tunnel);
+      if (summary) setTunnelBanner(summary);
       await mutate();
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : 'Failed to archive database');
@@ -145,6 +154,25 @@ export default function DatabasesPage() {
       {error && (
         <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
           {error.message}
+        </div>
+      )}
+
+      {tunnelBanner && (
+        <div
+          className={`flex items-center justify-between gap-4 rounded-xl border px-4 py-3 text-xs ${
+            tunnelBanner.ok
+              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+              : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+          }`}
+        >
+          <span>{tunnelBanner.text}</span>
+          <button
+            type="button"
+            onClick={() => setTunnelBanner(null)}
+            className="text-slate-400 hover:text-white shrink-0"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -323,10 +351,26 @@ export default function DatabasesPage() {
               </div>
             </div>
 
+            {(() => {
+              const summary = formatTunnelSummary(createdInfo.tunnel);
+              if (!summary) return null;
+              return (
+                <div
+                  className={`rounded-lg border px-3.5 py-2 text-xs ${
+                    summary.ok
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                      : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                  }`}
+                >
+                  {summary.text}
+                </div>
+              );
+            })()}
+
             <div>
               <div className="flex items-center justify-between mb-1.5">
                 <span className="text-xs font-medium text-slate-300">
-                  Verify with curl (after issuing TLS on /sites)
+                  Verify with curl
                 </span>
                 <button
                   type="button"

@@ -18,6 +18,7 @@ export interface SiteRecord {
   port: number | null;
   hasDb: boolean;
   isPanel: boolean;
+  tunnel?: boolean;
 }
 
 export async function GET() {

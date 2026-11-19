@@ -7,6 +7,8 @@ import { Modal } from '@/components/Modal';
 import { usePanel } from '@/components/PanelContext';
 import { StatusBadge } from '@/components/StatusBadge';
 import { apiFetcher, apiMutate } from '@/lib/client-api';
+import type { TunnelActionResult } from '@/lib/agent';
+import { formatTunnelSummary } from '@/lib/format';
 import { DOMAIN_RE, NAME_RE, RESERVED_NAMES, type SiteType } from '@/lib/validation';
 import type { SiteRecord } from '@/app/api/sites/route';
 
@@ -39,6 +41,10 @@ export default function SitesPage() {
   const [deleteTarget, setDeleteTarget] = useState<SiteRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [routingDomain, setRoutingDomain] = useState<string | null>(null);
+  const [tunnelBanner, setTunnelBanner] = useState<{ ok: boolean; text: string } | null>(
+    null
+  );
 
   const sites = data?.sites ?? [];
   const baseDomain = me?.baseDomain || 'mydomain.com';
@@ -69,8 +75,11 @@ export default function SitesPage() {
 
     setCreating(true);
     setCreateError(null);
+    setTunnelBanner(null);
     try {
-      await apiMutate('/api/sites', 'POST', me.csrfToken, {
+      const res = await apiMutate<{
+        site: { tunnel?: TunnelActionResult };
+      }>('/api/sites', 'POST', me.csrfToken, {
         name,
         type: siteType,
         domain: customDomain.trim() || undefined,
@@ -83,6 +92,8 @@ export default function SitesPage() {
       setName('');
       setCustomDomain('');
       setCustomPort('');
+      const summary = formatTunnelSummary(res.site?.tunnel);
+      if (summary) setTunnelBanner(summary);
       await mutate();
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : 'Failed to create site');
@@ -95,18 +106,47 @@ export default function SitesPage() {
     if (!me?.csrfToken || !deleteTarget) return;
     setDeleting(true);
     setDeleteError(null);
+    setTunnelBanner(null);
     try {
-      await apiMutate(
+      const res = await apiMutate<{
+        deleted: { tunnel?: TunnelActionResult };
+      }>(
         `/api/sites/${encodeURIComponent(deleteTarget.name)}`,
         'DELETE',
         me.csrfToken
       );
       setDeleteTarget(null);
+      const summary = formatTunnelSummary(res.deleted?.tunnel);
+      if (summary) setTunnelBanner(summary);
       await mutate();
     } catch (err) {
       setDeleteError(err instanceof Error ? err.message : 'Failed to archive site');
     } finally {
       setDeleting(false);
+    }
+  };
+
+  const handleRouteTunnel = async (domain: string) => {
+    if (!me?.csrfToken || routingDomain) return;
+    setRoutingDomain(domain);
+    setTunnelBanner(null);
+    try {
+      const res = await apiMutate<{ tunnel: TunnelActionResult }>(
+        '/api/tunnel',
+        'POST',
+        me.csrfToken,
+        { domain }
+      );
+      const summary = formatTunnelSummary(res.tunnel);
+      if (summary) setTunnelBanner(summary);
+      await mutate();
+    } catch (err) {
+      setTunnelBanner({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Failed to route tunnel',
+      });
+    } finally {
+      setRoutingDomain(null);
     }
   };
 
@@ -212,6 +252,25 @@ export default function SitesPage() {
         </div>
       )}
 
+      {tunnelBanner && (
+        <div
+          className={`flex items-center justify-between gap-4 rounded-xl border px-4 py-3 text-xs ${
+            tunnelBanner.ok
+              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+              : 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+          }`}
+        >
+          <span>{tunnelBanner.text}</span>
+          <button
+            type="button"
+            onClick={() => setTunnelBanner(null)}
+            className="text-slate-400 hover:text-white shrink-0"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       <div className="rounded-xl border border-borderline bg-surface overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
@@ -219,9 +278,9 @@ export default function SitesPage() {
               <tr>
                 <th className="px-5 py-3 font-medium">Domain</th>
                 <th className="px-5 py-3 font-medium">Type</th>
-                <th className="px-5 py-3 font-medium">TLS / SSL</th>
+                <th className="px-5 py-3 font-medium">Tunnel</th>
+                <th className="px-5 py-3 font-medium">Origin TLS</th>
                 <th className="px-5 py-3 font-medium">Target / Docroot</th>
-                <th className="px-5 py-3 font-medium">Status</th>
                 <th className="px-5 py-3 font-medium text-right">Actions</th>
               </tr>
             </thead>
@@ -237,7 +296,7 @@ export default function SitesPage() {
                   <tr key={`${site.name}-${site.serverName}`} className="hover:bg-elevated/40">
                     <td className="px-5 py-3.5">
                       <a
-                        href={`${site.ssl ? 'https' : 'http'}://${site.serverName}`}
+                        href={`https://${site.serverName}`}
                         target="_blank"
                         rel="noreferrer"
                         className="font-mono text-sm font-medium text-slate-100 hover:text-accent transition"
@@ -258,6 +317,25 @@ export default function SitesPage() {
                       />
                     </td>
                     <td className="px-5 py-3.5">
+                      {site.tunnel === undefined ? (
+                        <StatusBadge tone="slate" label="Local" />
+                      ) : site.tunnel ? (
+                        <StatusBadge tone="green" label="Cloudflare" dot />
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={routingDomain === site.serverName}
+                          onClick={() => handleRouteTunnel(site.serverName)}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-xs font-medium text-sky-300 hover:bg-sky-500/20 disabled:opacity-50 transition"
+                        >
+                          <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
+                          <span>
+                            {routingDomain === site.serverName ? 'Routing...' : 'Unrouted · Route'}
+                          </span>
+                        </button>
+                      )}
+                    </td>
+                    <td className="px-5 py-3.5">
                       {site.ssl ? (
                         <StatusBadge tone="green" label="TLS Active" dot />
                       ) : (
@@ -267,7 +345,7 @@ export default function SitesPage() {
                           className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-300 hover:bg-amber-500/20 transition"
                         >
                           <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-                          <span>HTTP Only · Get Cert</span>
+                          <span>HTTP :80 · Certbot</span>
                         </button>
                       )}
                     </td>
@@ -278,9 +356,6 @@ export default function SitesPage() {
                           Proxy 127.0.0.1:{site.port}
                         </div>
                       ) : null}
-                    </td>
-                    <td className="px-5 py-3.5">
-                      <StatusBadge tone="green" label="Enabled" dot />
                     </td>
                     <td className="px-5 py-3.5 text-right">
                       {site.isPanel ? (

@@ -14,7 +14,21 @@ export type AgentAction =
   | 'service.restart'
   | 'logs'
   | 'cert'
+  | 'tunnel.route'
   | 'activity.list';
+
+export interface TunnelActionResult {
+  enabled: boolean;
+  reason?: string;
+  hostname?: string;
+  service?: string;
+  tunnel?: string;
+  dns?: string;
+  ingress?: string;
+  restartScheduled?: boolean;
+  warnings?: string[];
+  error?: string;
+}
 
 export interface AgentResponse {
   ok: boolean;
@@ -34,7 +48,14 @@ export async function callControlAgent(
     throw new Error('Server misconfiguration: AGENT_SECRET is not set');
   }
 
-  const effectiveTimeout = timeoutMs ?? (action === 'cert' ? 125_000 : 30_000);
+  const effectiveTimeout =
+    timeoutMs ??
+    (action === 'cert' ||
+    action === 'tunnel.route' ||
+    action === 'site.create' ||
+    action === 'db.create'
+      ? 125_000
+      : 30_000);
 
   return new Promise<AgentResponse>((resolve, reject) => {
     const client = net.createConnection({ path: socketPath });

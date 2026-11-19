@@ -35,6 +35,14 @@ Control Agent (/opt/control-agent/agent.js, systemd, runs as `root`)
   - Supports `static`, `php`, and `nextjs`.
   - All templates include `IncludeOptional /etc/apache2/conf-app-db/__NAME__.conf`, so databases and sites with matching `<name>` compose seamlessly in either creation order.
   - `nextjs` sites auto-assign a local port (`3100+`), configure Apache `ProxyPass` while excluding `/db.php` (`ProxyPass /db.php !`), and create `/etc/systemd/system/app-<name>.service`.
+- **Cloudflare Tunnel (`cloudflared`) Auto-Routing**:
+  - When `cloudflared` and `/etc/cloudflared/config.yml` exist, creating a site or database automatically runs:
+    1. `cloudflared tunnel route dns <tunnel> <hostname>` (using `~/.cloudflared/cert.pem` / `TUNNEL_ORIGIN_CERT`)
+    2. Inserts `# dietpi-panel:managed` + `- hostname: <hostname>` / `service: http://localhost:80` before the catch-all rule in `/etc/cloudflared/config.yml`
+    3. Validates the config with `cloudflared --config ... tunnel ingress validate` (rolling back on error)
+    4. Schedules `systemctl restart cloudflared` ~2 seconds after sending the API response so the dashboard session isn't dropped mid-request.
+  - Deleting a site or `dbonly` database removes only `# dietpi-panel:managed` ingress entries from `/etc/cloudflared/config.yml` (existing Cloudflare DNS CNAME records are left untouched since `cloudflared` CLI does not delete DNS records).
+  - Customize defaults in `/etc/control-agent/config.env` (`CF_ENABLED`, `CF_TUNNEL_NAME`, `CF_CONFIG`, `CF_SERVICE_URL`, `CF_UNIT`, `TUNNEL_ORIGIN_CERT`).
 
 ## Security Model
 

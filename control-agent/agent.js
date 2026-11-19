@@ -57,6 +57,9 @@ const MUTATING_ACTIONS = new Set([
   'site.delete',
   'service.restart',
   'cert',
+  'tunnel.route',
+  'tunnel.unroute',
+  'tunnel.restart',
 ]);
 
 function validateSecretConfigured() {
@@ -173,7 +176,14 @@ function getAllowedUnits() {
     }
   }
 
-  const priority = ['apache2', 'control-agent', 'dietpi-panel'];
+  if (
+    UNIT_RE.test(CF_UNIT) &&
+    (fs.existsSync(CF_CONFIG_PATH) || fs.existsSync(`/lib/systemd/system/${CF_UNIT}.service`))
+  ) {
+    units.add(CF_UNIT);
+  }
+
+  const priority = ['apache2', 'control-agent', 'dietpi-panel', CF_UNIT];
   const list = Array.from(units);
   list.sort((a, b) => {
     const ia = priority.indexOf(a);
@@ -204,7 +214,7 @@ function validateAllowedUnit(rawUnit) {
   return unit;
 }
 
-async function runBin(binPath, args, timeout = DEFAULT_TIMEOUT_MS) {
+async function runBin(binPath, args, timeout = DEFAULT_TIMEOUT_MS, extraEnv = {}) {
   try {
     const { stdout, stderr } = await execFileAsync(binPath, args, {
       shell: false,
@@ -214,6 +224,7 @@ async function runBin(binPath, args, timeout = DEFAULT_TIMEOUT_MS) {
         ...process.env,
         PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         BASE_DOMAIN,
+        ...extraEnv,
       },
     });
     return { ok: true, stdout: stdout || '', stderr: stderr || '', code: 0 };
@@ -261,6 +272,413 @@ function movePathSafe(src, dest) {
   }
 }
 
+function readVhostServerName(vhostPath) {
+  try {
+    const content = fs.readFileSync(vhostPath, 'utf8');
+    const m = content.match(/^\s*ServerName\s+([^\s#]+)/im);
+    return m ? m[1].trim().toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+function lastLine(text) {
+  const lines = String(text || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return (lines[lines.length - 1] || '').slice(0, 300);
+}
+
+// ---------------------------------------------------------------------------
+// Cloudflare Tunnel (cloudflared) integration
+//
+// On site/db create:  cloudflared tunnel route dns <tunnel> <hostname>
+//                     + insert "- hostname: <hostname> / service: CF_SERVICE_URL"
+//                       before the catch-all rule in /etc/cloudflared/config.yml
+//                     + validate, then restart cloudflared in the background.
+// On site/db delete:  remove the ingress entry (only entries this panel added,
+//                     marked with "# dietpi-panel:managed"). DNS records are kept.
+// ---------------------------------------------------------------------------
+
+const CF_ENABLED = (process.env.CF_ENABLED || 'auto').trim().toLowerCase();
+const CF_CONFIG_PATH = process.env.CF_CONFIG || '/etc/cloudflared/config.yml';
+const CF_SERVICE_URL = (process.env.CF_SERVICE_URL || 'http://localhost:80').trim();
+const CF_UNIT = (process.env.CF_UNIT || 'cloudflared').trim().replace(/\.service$/, '');
+const CF_TUNNEL_NAME = (process.env.CF_TUNNEL_NAME || '').trim();
+const CF_MARKER = '# dietpi-panel:managed';
+const CF_RESTART_DELAY_MS = 2000;
+const CF_SERVICE_URL_RE = /^https?:\/\/[a-zA-Z0-9.-]+(:\d{1,5})?\/?$/;
+const CF_TUNNEL_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+function stripYamlScalar(raw) {
+  let v = String(raw || '').trim();
+  v = v.replace(/\s+#.*$/, '').trim();
+  if (
+    v.length >= 2 &&
+    ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))
+  ) {
+    v = v.slice(1, -1);
+  }
+  return v.trim();
+}
+
+function parseIngress(content) {
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  const lines = content.split(/\r?\n/);
+  const ingressIdx = lines.findIndex((l) => /^ingress:\s*(#.*)?$/.test(l));
+  if (ingressIdx === -1) {
+    return { eol, lines, ingressIdx: -1, end: -1, itemIndent: null, items: [] };
+  }
+
+  // The ingress block ends at the next top-level key (non-list, non-comment line at column 0)
+  let end = lines.length;
+  for (let i = ingressIdx + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0 && !trimmed.startsWith('-') && !trimmed.startsWith('#')) {
+      end = i;
+      break;
+    }
+  }
+
+  let itemIndent = null;
+  const starts = [];
+  for (let i = ingressIdx + 1; i < end; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!(trimmed === '-' || trimmed.startsWith('- '))) continue;
+    const indent = line.length - line.trimStart().length;
+    if (itemIndent === null) itemIndent = indent;
+    if (indent === itemIndent) starts.push(i);
+  }
+
+  const items = starts.map((start, k) => {
+    let last = (k + 1 < starts.length ? starts[k + 1] : end) - 1;
+    while (last > start && (!lines[last].trim() || lines[last].trim().startsWith('#'))) {
+      last -= 1;
+    }
+    let hostname = '';
+    let service = '';
+    for (let i = start; i <= last; i += 1) {
+      const m = lines[i].match(/^\s*(?:-\s+)?([A-Za-z]+):\s*(.*)$/);
+      if (!m) continue;
+      if (m[1] === 'hostname' && !hostname) hostname = stripYamlScalar(m[2]).toLowerCase();
+      if (m[1] === 'service' && !service) service = stripYamlScalar(m[2]);
+    }
+    const managed = start > 0 && lines[start - 1].trim() === CF_MARKER;
+    return { start, end: last, hostname, service, managed, markerIdx: managed ? start - 1 : null };
+  });
+
+  return { eol, lines, ingressIdx, end, itemIndent, items };
+}
+
+function listIngressRules(content) {
+  return parseIngress(content).items.map(({ hostname, service, managed }) => ({
+    hostname,
+    service,
+    managed,
+  }));
+}
+
+function addIngressHostname(content, hostname, service) {
+  const host = String(hostname).toLowerCase();
+  const p = parseIngress(content);
+  if (p.ingressIdx === -1) {
+    throw new Error('No top-level "ingress:" block found in the cloudflared config');
+  }
+  if (p.items.some((it) => it.hostname === host)) {
+    return { content, changed: false };
+  }
+
+  const pad = ' '.repeat(p.itemIndent === null ? 2 : p.itemIndent);
+  const block = [`${pad}${CF_MARKER}`, `${pad}- hostname: ${host}`, `${pad}  service: ${service}`];
+  const lines = p.lines.slice();
+  const last = p.items[p.items.length - 1];
+
+  if (!last) {
+    lines.splice(p.ingressIdx + 1, 0, ...block, `${pad}- service: http_status:404`);
+  } else if (!last.hostname) {
+    // Insert before the catch-all rule, which cloudflared requires to stay last
+    lines.splice(last.markerIdx === null ? last.start : last.markerIdx, 0, ...block);
+  } else {
+    lines.splice(last.end + 1, 0, ...block);
+  }
+
+  return { content: lines.join(p.eol), changed: true };
+}
+
+function removeIngressHostname(content, hostname) {
+  const host = String(hostname).toLowerCase();
+  const p = parseIngress(content);
+  if (p.ingressIdx === -1) return { content, changed: false, reason: 'absent' };
+  const item = p.items.find((it) => it.hostname === host);
+  if (!item) return { content, changed: false, reason: 'absent' };
+  if (!item.managed) return { content, changed: false, reason: 'not-managed' };
+
+  const lines = p.lines.slice();
+  const from = item.markerIdx === null ? item.start : item.markerIdx;
+  lines.splice(from, item.end - from + 1);
+  return { content: lines.join(p.eol), changed: true };
+}
+
+function findCloudflaredBin() {
+  for (const candidate of ['/usr/local/bin/cloudflared', '/usr/bin/cloudflared']) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function findOriginCert() {
+  const candidates = [];
+  if (process.env.TUNNEL_ORIGIN_CERT) candidates.push(process.env.TUNNEL_ORIGIN_CERT);
+  candidates.push(
+    '/root/.cloudflared/cert.pem',
+    '/etc/cloudflared/cert.pem',
+    '/usr/local/etc/cloudflared/cert.pem'
+  );
+  try {
+    for (const user of fs.readdirSync('/home')) {
+      candidates.push(path.join('/home', user, '.cloudflared', 'cert.pem'));
+    }
+  } catch {
+    // no /home
+  }
+  return (
+    candidates.find((c) => {
+      try {
+        return fs.statSync(c).isFile();
+      } catch {
+        return false;
+      }
+    }) || null
+  );
+}
+
+function getTunnelSettings() {
+  const base = {
+    enabled: false,
+    reason: '',
+    configPath: CF_CONFIG_PATH,
+    serviceUrl: CF_SERVICE_URL,
+    unit: CF_UNIT,
+    tunnel: '',
+    originCert: null,
+    bin: null,
+  };
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(CF_ENABLED)) {
+    return { ...base, reason: 'Disabled via CF_ENABLED' };
+  }
+  const bin = findCloudflaredBin();
+  if (!bin) return { ...base, reason: 'cloudflared binary not found' };
+  if (!fs.existsSync(CF_CONFIG_PATH)) return { ...base, bin, reason: `${CF_CONFIG_PATH} not found` };
+  if (!CF_SERVICE_URL_RE.test(CF_SERVICE_URL)) {
+    return { ...base, bin, reason: 'CF_SERVICE_URL is invalid (expected e.g. http://localhost:80)' };
+  }
+  if (!UNIT_RE.test(CF_UNIT)) return { ...base, bin, reason: 'CF_UNIT is invalid' };
+
+  let tunnel = CF_TUNNEL_NAME;
+  if (!tunnel) {
+    const m = fs.readFileSync(CF_CONFIG_PATH, 'utf8').match(/^tunnel:\s*(.+)$/m);
+    if (m) tunnel = stripYamlScalar(m[1]);
+  }
+  if (!tunnel || !CF_TUNNEL_RE.test(tunnel)) {
+    return { ...base, bin, reason: 'Tunnel name/ID not found (set CF_TUNNEL_NAME)' };
+  }
+
+  return { ...base, enabled: true, bin, tunnel, originCert: findOriginCert() };
+}
+
+let cfLock = Promise.resolve();
+function withTunnelLock(fn) {
+  const run = cfLock.then(fn, fn);
+  cfLock = run.catch(() => {});
+  return run;
+}
+
+let cfRestartTimer = null;
+function scheduleCloudflaredRestart(delayMs = CF_RESTART_DELAY_MS) {
+  if (cfRestartTimer) clearTimeout(cfRestartTimer);
+  cfRestartTimer = setTimeout(() => {
+    cfRestartTimer = null;
+    const child = spawn('systemctl', ['restart', CF_UNIT], {
+      detached: true,
+      stdio: 'ignore',
+      shell: false,
+    });
+    child.on('error', () => {});
+    child.unref();
+    appendAuditLog('tunnel.restart', { unit: CF_UNIT }, true, 'Restart triggered after ingress change');
+  }, delayMs);
+}
+
+async function writeValidatedTunnelConfig(settings, newContent) {
+  const stat = fs.statSync(CF_CONFIG_PATH);
+  const tmpPath = `${CF_CONFIG_PATH}.dietpi-new`;
+  fs.rmSync(tmpPath, { force: true });
+  fs.writeFileSync(tmpPath, newContent, { mode: stat.mode & 0o777 });
+  try {
+    const v = await runBin(settings.bin, ['--config', tmpPath, 'tunnel', 'ingress', 'validate']);
+    if (!v.ok) {
+      throw new Error(`cloudflared ingress validation failed: ${lastLine(v.stderr || v.stdout)}`);
+    }
+    fs.copyFileSync(CF_CONFIG_PATH, `${CF_CONFIG_PATH}.dietpi-bak`);
+    fs.chownSync(tmpPath, stat.uid, stat.gid);
+    fs.renameSync(tmpPath, CF_CONFIG_PATH);
+  } finally {
+    fs.rmSync(tmpPath, { force: true });
+  }
+}
+
+async function tunnelAddHostname(rawDomain) {
+  const settings = getTunnelSettings();
+  if (!settings.enabled) return { enabled: false, reason: settings.reason };
+
+  const result = {
+    enabled: true,
+    hostname: '',
+    service: settings.serviceUrl,
+    tunnel: settings.tunnel,
+    dns: 'skipped',
+    ingress: 'skipped',
+    restartScheduled: false,
+    warnings: [],
+  };
+
+  try {
+    const hostname = validateDomain(rawDomain);
+    result.hostname = hostname;
+
+    const env = settings.originCert ? { TUNNEL_ORIGIN_CERT: settings.originCert } : {};
+    if (!settings.originCert) {
+      result.warnings.push('No cloudflared origin cert.pem found; DNS routing may fail (set TUNNEL_ORIGIN_CERT).');
+    }
+    const dns = await runBin(
+      settings.bin,
+      ['tunnel', 'route', 'dns', settings.tunnel, hostname],
+      60_000,
+      env
+    );
+    const dnsOut = `${dns.stdout}\n${dns.stderr}`;
+    if (dns.ok) {
+      result.dns = /already configured/i.test(dnsOut) ? 'exists' : 'routed';
+    } else if (/already exists/i.test(dnsOut)) {
+      result.dns = 'exists';
+      result.warnings.push(
+        `A DNS record for ${hostname} already exists and was left unchanged; make sure it is a CNAME to this tunnel.`
+      );
+    } else {
+      result.dns = 'failed';
+      result.warnings.push(`DNS route failed: ${lastLine(dnsOut)}`);
+    }
+
+    await withTunnelLock(async () => {
+      const original = fs.readFileSync(CF_CONFIG_PATH, 'utf8');
+      const { content, changed } = addIngressHostname(original, hostname, settings.serviceUrl);
+      if (!changed) {
+        result.ingress = 'exists';
+        return;
+      }
+      await writeValidatedTunnelConfig(settings, content);
+      result.ingress = 'added';
+      scheduleCloudflaredRestart();
+      result.restartScheduled = true;
+    });
+  } catch (err) {
+    result.error = err instanceof Error ? err.message : String(err);
+  }
+
+  appendAuditLog(
+    'tunnel.route',
+    { hostname: result.hostname || String(rawDomain || '') },
+    !result.error && result.dns !== 'failed',
+    result.error || result.warnings.join(' | ') || `dns=${result.dns} ingress=${result.ingress}`
+  );
+  return result;
+}
+
+async function tunnelRemoveHostname(rawDomain) {
+  const settings = getTunnelSettings();
+  if (!settings.enabled) return { enabled: false, reason: settings.reason };
+
+  const result = {
+    enabled: true,
+    hostname: '',
+    ingress: 'skipped',
+    restartScheduled: false,
+    warnings: [],
+  };
+
+  try {
+    const hostname = validateDomain(rawDomain);
+    result.hostname = hostname;
+    if (hostname === `panel.${BASE_DOMAIN}`) {
+      throw new Error('Refusing to remove the panel hostname from the tunnel');
+    }
+
+    await withTunnelLock(async () => {
+      const original = fs.readFileSync(CF_CONFIG_PATH, 'utf8');
+      const { content, changed, reason } = removeIngressHostname(original, hostname);
+      if (!changed) {
+        result.ingress = reason || 'absent';
+        if (reason === 'not-managed') {
+          result.warnings.push(
+            `${hostname} was not added by DietPi Panel, so its ingress rule was left in place.`
+          );
+        }
+        return;
+      }
+      await writeValidatedTunnelConfig(settings, content);
+      result.ingress = 'removed';
+      scheduleCloudflaredRestart();
+      result.restartScheduled = true;
+    });
+    result.warnings.push(
+      `The Cloudflare DNS record for ${hostname} was kept; delete it in the Cloudflare dashboard if no longer needed.`
+    );
+  } catch (err) {
+    result.error = err instanceof Error ? err.message : String(err);
+  }
+
+  appendAuditLog(
+    'tunnel.unroute',
+    { hostname: result.hostname || String(rawDomain || '') },
+    !result.error,
+    result.error || `ingress=${result.ingress}`
+  );
+  return result;
+}
+
+function getTunnelHostnameSet() {
+  try {
+    if (!fs.existsSync(CF_CONFIG_PATH)) return null;
+    const rules = listIngressRules(fs.readFileSync(CF_CONFIG_PATH, 'utf8'));
+    return new Set(rules.map((r) => r.hostname).filter(Boolean));
+  } catch {
+    return null;
+  }
+}
+
+function attachTunnelResult(stdout, tunnel) {
+  try {
+    const payload = JSON.parse(stdout);
+    payload.tunnel = tunnel;
+    return JSON.stringify(payload);
+  } catch {
+    return stdout;
+  }
+}
+
+function parseJsonSafe(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 async function handleAction(action, params = {}, socket = null) {
   if (params === null || typeof params !== 'object' || Array.isArray(params)) {
     throw new Error('params must be an object');
@@ -277,7 +695,12 @@ async function handleAction(action, params = {}, socket = null) {
       if (!res.ok) {
         return { ok: false, stdout: res.stdout, stderr: res.stderr };
       }
-      return { ok: true, stdout: res.stdout.trim(), stderr: res.stderr };
+      const created = parseJsonSafe(res.stdout.trim());
+      if (!created || !created.domain) {
+        return { ok: true, stdout: res.stdout.trim(), stderr: res.stderr };
+      }
+      const tunnel = await tunnelAddHostname(created.domain);
+      return { ok: true, stdout: attachTunnelResult(res.stdout.trim(), tunnel), stderr: res.stderr };
     }
 
     case 'db.list': {
@@ -316,9 +739,11 @@ async function handleAction(action, params = {}, socket = null) {
 
       const vhostPath = `/etc/apache2/sites-available/${name}.conf`;
       let removedDbonlyVhost = false;
+      let dbonlyDomain = '';
       if (fs.existsSync(vhostPath)) {
         const vhostContent = fs.readFileSync(vhostPath, 'utf8');
         if (vhostContent.includes('# dietpi-panel:type=dbonly')) {
+          dbonlyDomain = readVhostServerName(vhostPath);
           await runBin('a2dissite', [`${name}.conf`]);
           const leSslPath = `/etc/apache2/sites-available/${name}-le-ssl.conf`;
           if (fs.existsSync(leSslPath)) {
@@ -341,9 +766,11 @@ async function handleAction(action, params = {}, socket = null) {
       }
       await runBin('systemctl', ['reload', 'apache2']);
 
+      const dbTunnel = dbonlyDomain ? await tunnelRemoveHostname(dbonlyDomain) : undefined;
+
       return {
         ok: true,
-        stdout: JSON.stringify({ name, archivedTo: trashDir, removedDbonlyVhost }),
+        stdout: JSON.stringify({ name, archivedTo: trashDir, removedDbonlyVhost, tunnel: dbTunnel }),
         stderr: '',
       };
     }
@@ -368,12 +795,29 @@ async function handleAction(action, params = {}, socket = null) {
       }
 
       const res = await runBin('/usr/local/bin/mksite', [name, type, domain, portStr]);
-      return { ok: res.ok, stdout: res.stdout.trim(), stderr: res.stderr };
+      if (!res.ok) {
+        return { ok: false, stdout: res.stdout.trim(), stderr: res.stderr };
+      }
+      const created = parseJsonSafe(res.stdout.trim());
+      if (!created || !created.domain) {
+        return { ok: true, stdout: res.stdout.trim(), stderr: res.stderr };
+      }
+      const tunnel = await tunnelAddHostname(created.domain);
+      return { ok: true, stdout: attachTunnelResult(res.stdout.trim(), tunnel), stderr: res.stderr };
     }
 
     case 'site.list': {
       const res = await runBin('/usr/local/bin/listsites', []);
-      return { ok: res.ok, stdout: res.stdout.trim() || '[]', stderr: res.stderr };
+      const raw = res.stdout.trim() || '[]';
+      const hostSet = res.ok ? getTunnelHostnameSet() : null;
+      const sites = hostSet ? parseJsonSafe(raw) : null;
+      if (!Array.isArray(sites)) {
+        return { ok: res.ok, stdout: raw, stderr: res.stderr };
+      }
+      for (const site of sites) {
+        site.tunnel = hostSet.has(String(site.serverName || '').toLowerCase());
+      }
+      return { ok: true, stdout: JSON.stringify(sites), stderr: res.stderr };
     }
 
     case 'site.delete': {
@@ -387,6 +831,7 @@ async function handleAction(action, params = {}, socket = null) {
         throw new Error(`Site "${name}" does not exist`);
       }
 
+      const siteDomain = readVhostServerName(vhostPath);
       const archiveBase = '/srv/backups/sites';
       fs.mkdirSync(archiveBase, { recursive: true, mode: 0o750 });
       const archiveDir = path.join(archiveBase, `${name}-${timestampSlug()}`);
@@ -416,9 +861,11 @@ async function handleAction(action, params = {}, socket = null) {
       }
       await runBin('systemctl', ['reload', 'apache2']);
 
+      const siteTunnel = siteDomain ? await tunnelRemoveHostname(siteDomain) : undefined;
+
       return {
         ok: true,
-        stdout: JSON.stringify({ name, archivedTo: archiveDir }),
+        stdout: JSON.stringify({ name, archivedTo: archiveDir, tunnel: siteTunnel }),
         stderr: '',
       };
     }
@@ -463,8 +910,9 @@ async function handleAction(action, params = {}, socket = null) {
 
     case 'service.restart': {
       const unit = validateAllowedUnit(params.unit);
-      if (unit === 'control-agent' || unit === 'dietpi-panel') {
+      if (unit === 'control-agent' || unit === 'dietpi-panel' || unit === CF_UNIT) {
         // Respond first so the caller receives confirmation before systemd restarts the process
+        // (restarting cloudflared also drops the tunnel carrying the panel's own HTTP response)
         const payload = {
           ok: true,
           stdout: JSON.stringify({ unit, restarted: true, scheduled: true }),
@@ -480,7 +928,7 @@ async function handleAction(action, params = {}, socket = null) {
             shell: false,
           });
           child.unref();
-        }, 200);
+        }, unit === CF_UNIT ? CF_RESTART_DELAY_MS : 200);
         return { ...payload, _alreadyWritten: true };
       }
 
@@ -530,6 +978,22 @@ async function handleAction(action, params = {}, socket = null) {
 
       const res = await runBin('certbot', args, CERTBOT_TIMEOUT_MS);
       return { ok: res.ok, stdout: res.stdout, stderr: res.stderr };
+    }
+
+    case 'tunnel.route': {
+      const domain = validateDomain(params.domain);
+      const managedDomains = getManagedSiteDomains();
+      if (!managedDomains.has(domain)) {
+        throw new Error(`Domain "${domain}" does not match any configured Apache virtual host`);
+      }
+      const tunnel = await tunnelAddHostname(domain);
+      if (!tunnel.enabled) {
+        throw new Error(`Cloudflare tunnel integration unavailable: ${tunnel.reason}`);
+      }
+      if (tunnel.error) {
+        return { ok: false, stdout: JSON.stringify(tunnel), stderr: tunnel.error };
+      }
+      return { ok: true, stdout: JSON.stringify(tunnel), stderr: '' };
     }
 
     case 'stats': {
@@ -777,6 +1241,10 @@ module.exports = {
   validateDomain,
   timingSafeEqualSecret,
   sanitizeParamsForLog,
+  parseIngress,
+  listIngressRules,
+  addIngressHostname,
+  removeIngressHostname,
   NAME_RE,
   DOMAIN_RE,
   UNIT_RE,

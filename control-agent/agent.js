@@ -1610,7 +1610,12 @@ function findExecutable(candidates) {
   return null;
 }
 
-async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv = {}) {
+async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv = {}, options = {}) {
+  const rawOutput = Boolean(options && options.rawOutput);
+  const maxBuffer =
+    typeof options?.maxBuffer === 'number' && options.maxBuffer > 0
+      ? options.maxBuffer
+      : 4 * 1024 * 1024;
   const { uid, gid } = getWwwDataIds();
   const wwwHome = '/tmp/dp-www-home';
   const cacheDirs = [
@@ -1650,7 +1655,7 @@ async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv
       gid,
       shell: false,
       timeout,
-      maxBuffer: 4 * 1024 * 1024,
+      maxBuffer,
       env: {
         PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
         HOME: wwwHome,
@@ -1667,16 +1672,16 @@ async function runAsWwwData(bin, args, cwd, timeout = BUILD_TIMEOUT_MS, extraEnv
     return {
       cmd: `${path.basename(bin)} ${args.join(' ')}`.trim(),
       ok: true,
-      stdout: (stdout || '').slice(-8000),
-      stderr: (stderr || '').slice(-4000),
+      stdout: rawOutput ? (stdout || '') : (stdout || '').slice(-8000),
+      stderr: rawOutput ? (stderr || '') : (stderr || '').slice(-4000),
       durationMs: Date.now() - start,
     };
   } catch (err) {
     return {
       cmd: `${path.basename(bin)} ${args.join(' ')}`.trim(),
       ok: false,
-      stdout: (typeof err.stdout === 'string' ? err.stdout : '').slice(-8000),
-      stderr: (typeof err.stderr === 'string' && err.stderr ? err.stderr : err.message).slice(-4000),
+      stdout: rawOutput ? (typeof err.stdout === 'string' ? err.stdout : '') : (typeof err.stdout === 'string' ? err.stdout : '').slice(-8000),
+      stderr: rawOutput ? (typeof err.stderr === 'string' && err.stderr ? err.stderr : err.message) : (typeof err.stderr === 'string' && err.stderr ? err.stderr : err.message).slice(-4000),
       durationMs: Date.now() - start,
     };
   }
@@ -2107,7 +2112,14 @@ async function runDbStudio(dbName, op, payload = {}) {
     chownPathNoFollow(reqPath, uid, gid);
 
     const timeoutMs = op === 'script.exec' ? 120_000 : 30_000;
-    const step = await runAsWwwData(phpBin, [studioScript, reqPath], dbDir, timeoutMs);
+    const step = await runAsWwwData(
+      phpBin,
+      [studioScript, reqPath],
+      dbDir,
+      timeoutMs,
+      {},
+      { rawOutput: true, maxBuffer: 16 * 1024 * 1024 }
+    );
     const parsed = parseJsonSafe(step.stdout.trim());
     if (parsed && typeof parsed === 'object') {
       if (parsed.ok) {
@@ -2119,10 +2131,11 @@ async function runDbStudio(dbName, op, payload = {}) {
         stderr: parsed.error || step.stderr || 'Database operation failed',
       };
     }
+    const detail = (step.stderr || step.stdout || '').trim();
     return {
       ok: false,
       stdout: '',
-      stderr: step.stderr || step.stdout || 'Invalid response from database studio worker',
+      stderr: detail ? detail.slice(-1000) : 'Invalid response from database studio worker',
     };
   } finally {
     fs.rmSync(stageDir, { recursive: true, force: true });

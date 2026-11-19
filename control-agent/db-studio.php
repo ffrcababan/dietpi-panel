@@ -797,7 +797,7 @@ function rebuildTableForColumnUpdate(
                 $parts[] = 'AUTOINCREMENT';
             }
         }
-        if ($notNull && !($singlePk && $isPk)) {
+        if ($notNull && !($singlePk && $isPk && strtoupper($type) === 'INTEGER')) {
             $parts[] = 'NOT NULL';
         }
         if ($dflt !== null && $dflt !== '') {

@@ -198,14 +198,90 @@ find_php_bin() {
     return 1
 }
 
+has_dietpi_apache_conf() {
+    [[ -f /etc/apache2/conf-enabled/dietpi.conf || -f /etc/apache2/conf-available/dietpi.conf ]]
+}
+
+has_enabled_mod_php() {
+    local f
+    for f in /etc/apache2/mods-enabled/php*.load; do
+        [[ -e "$f" ]] && return 0
+    done
+    return 1
+}
+
+detect_debian_php_fpm() {
+    local php_bin ver conf base candidate=""
+    php_bin="$(find_php_bin || true)"
+    if [[ -n "$php_bin" ]]; then
+        ver="$("$php_bin" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+        if [[ -n "$ver" && -f "/etc/apache2/conf-available/php${ver}-fpm.conf" ]] \
+           && systemctl list-unit-files "php${ver}-fpm.service" --no-legend 2>/dev/null | grep -q "^php${ver}-fpm\.service"; then
+            echo "php${ver}-fpm"
+            return 0
+        fi
+    fi
+    for conf in /etc/apache2/conf-available/php*-fpm.conf; do
+        [[ -e "$conf" ]] || continue
+        base="$(basename "$conf" .conf)"
+        if systemctl list-unit-files "${base}.service" --no-legend 2>/dev/null | grep -q "^${base}\.service"; then
+            candidate="$base"
+        fi
+    done
+    if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+guard_dietpi_mpm_conf() {
+    local conf="/etc/apache2/conf-enabled/dietpi.conf"
+    [[ -f "$conf" ]] || return 0
+    local current_mpm
+    current_mpm="$(a2query -M 2>/dev/null || true)"
+    [[ "$current_mpm" == "prefork" ]] || return 0
+    if grep -Eq '^[[:space:]]*(ThreadsPerChild|ThreadLimit|MinSpareThreads|MaxSpareThreads|AsyncRequestWorkerFactor)\b' "$conf"; then
+        warn "Apache is running mpm_prefork while ${conf} defines threaded MPM directives; wrapping them in <IfModule mpm_event_module>."
+        local target
+        target="$(readlink -f "$conf" 2>/dev/null || echo "$conf")"
+        awk '
+            BEGIN { in_mpm_ifmod = 0; wrapped = 0 }
+            /^[[:space:]]*<IfModule[[:space:]]+mpm_(event|worker)_module>/ {
+                if (wrapped) { print "</IfModule>"; wrapped = 0 }
+                in_mpm_ifmod = 1
+            }
+            /^[[:space:]]*<\/IfModule>/ {
+                if (wrapped) { print "</IfModule>"; wrapped = 0 }
+                in_mpm_ifmod = 0
+            }
+            {
+                if (!in_mpm_ifmod && $0 ~ /^[[:space:]]*(ThreadsPerChild|ThreadLimit|MinSpareThreads|MaxSpareThreads|AsyncRequestWorkerFactor)[[:space:]]+/) {
+                    if (!wrapped) { print "<IfModule mpm_event_module>"; wrapped = 1 }
+                    print "    " $0
+                } else {
+                    if (wrapped) { print "</IfModule>"; wrapped = 0 }
+                    print $0
+                }
+            }
+            END { if (wrapped) print "</IfModule>" }
+        ' "$target" > "${target}.tmp" && chmod 0644 "${target}.tmp" && mv "${target}.tmp" "$target"
+    fi
+}
+
 install_stack_debian() {
     export DEBIAN_FRONTEND=noninteractive
     log "Installing/verifying required stack via apt (${DISTRO_ID})..."
     apt-get update -y
 
+    local php_apache_pkg="php-fpm"
+    if ! has_dietpi_apache_conf && has_enabled_mod_php && ! detect_debian_php_fpm >/dev/null; then
+        php_apache_pkg="libapache2-mod-php"
+    fi
+
     local core_pkgs=(
         apache2
-        libapache2-mod-php
+        "$php_apache_pkg"
         php-cli
         php-sqlite3
         php-mbstring
@@ -400,6 +476,13 @@ fi
 if ! "$PHP_BIN" -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);'; then
     echo "Error: PHP pdo_sqlite extension is required ($PHP_BIN missing pdo_sqlite)." >&2
     exit 1
+fi
+
+if [[ "$DISTRO_FAMILY" == "debian" && -z "$PHP_FPM_SERVICE" ]]; then
+    DEBIAN_FPM="$(detect_debian_php_fpm 2>/dev/null || true)"
+    if [[ -n "$DEBIAN_FPM" ]] && { has_dietpi_apache_conf || ! has_enabled_mod_php || a2query -q -c "$DEBIAN_FPM" >/dev/null 2>&1; }; then
+        PHP_FPM_SERVICE="$DEBIAN_FPM"
+    fi
 fi
 
 if ! id -u "$WEB_USER" >/dev/null 2>&1; then
@@ -641,10 +724,39 @@ systemctl restart control-agent.service
 systemctl enable dietpi-panel.service
 systemctl restart dietpi-panel.service
 
+APACHE_NEEDS_RESTART=0
+
+configure_apache_debian() {
+    if [[ -n "$PHP_FPM_SERVICE" && -f "/etc/apache2/conf-available/${PHP_FPM_SERVICE}.conf" ]]; then
+        local modload modname current_mpm mpm
+        current_mpm="$(a2query -M 2>/dev/null || true)"
+        for modload in /etc/apache2/mods-enabled/php*.load; do
+            [[ -e "$modload" ]] || continue
+            modname="$(basename "$modload" .load)"
+            log "Disabling mod_php (${modname}) for ${PHP_FPM_SERVICE} + mpm_event..."
+            a2dismod "$modname" >/dev/null || true
+            APACHE_NEEDS_RESTART=1
+        done
+        if [[ "$current_mpm" != "event" ]]; then
+            for mpm in mpm_prefork mpm_worker; do
+                a2dismod "$mpm" >/dev/null 2>&1 || true
+            done
+            a2enmod mpm_event >/dev/null || true
+            APACHE_NEEDS_RESTART=1
+        fi
+        a2enmod proxy proxy_http proxy_fcgi setenvif headers rewrite ssl env dir mime >/dev/null || true
+        a2enconf "$PHP_FPM_SERVICE" >/dev/null || true
+        systemctl enable --now "$PHP_FPM_SERVICE"
+    else
+        a2enmod proxy proxy_http headers rewrite ssl env dir mime >/dev/null || true
+    fi
+    guard_dietpi_mpm_conf
+}
+
 # 11. Configure Apache modules, distro base include, SELinux, firewall, and panel vhost
 log "Configuring Apache HTTP server (${APACHE_SERVICE})..."
 if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-    a2enmod proxy proxy_http headers rewrite ssl env dir mime >/dev/null || true
+    configure_apache_debian
 elif [[ "$DISTRO_FAMILY" == "suse" ]]; then
     if command -v a2enmod >/dev/null 2>&1; then
         for mod in proxy proxy_http headers rewrite ssl env dir mime php8 php php7; do
@@ -731,7 +843,11 @@ fi
 "$APACHE_CTL" configtest >/dev/null
 systemctl enable "$APACHE_SERVICE" >/dev/null 2>&1 || true
 if systemctl is-active --quiet "$APACHE_SERVICE"; then
-    systemctl reload "$APACHE_SERVICE"
+    if [[ "${APACHE_NEEDS_RESTART:-0}" -eq 1 ]]; then
+        systemctl restart "$APACHE_SERVICE"
+    else
+        systemctl reload "$APACHE_SERVICE"
+    fi
 else
     systemctl start "$APACHE_SERVICE"
 fi

@@ -1,6 +1,6 @@
 [Unit]
 Description=DietPi Panel Privileged Control Agent
-After=network.target apache2.service
+After=network.target __APACHE_SERVICE__.service
 
 [Service]
 Type=simple

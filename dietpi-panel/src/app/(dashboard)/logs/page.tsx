@@ -5,13 +5,16 @@ import { useSearchParams } from 'next/navigation';
 import useSWR from 'swr';
 import { IconCheck, IconCopy, IconRefresh } from '@/components/Icons';
 import { apiFetcher } from '@/lib/client-api';
+import { usePanel } from '@/components/PanelContext';
 import type { ServiceRecord } from '@/app/api/services/route';
 
 const LINE_OPTIONS = [50, 100, 250, 500, 1000];
 
 function LogsViewerInner() {
+  const { me } = usePanel();
+  const defaultApacheUnit = me?.apacheUnit || 'apache2';
   const searchParams = useSearchParams();
-  const initialUnit = searchParams.get('unit') || 'apache2';
+  const initialUnit = searchParams.get('unit') || defaultApacheUnit;
 
   const [unit, setUnit] = useState(initialUnit);
   const [lines, setLines] = useState(100);
@@ -45,7 +48,7 @@ function LogsViewerInner() {
   );
 
   const serviceUnits = servicesData?.services?.map((s) => s.unit) ?? [
-    'apache2',
+    defaultApacheUnit,
     'control-agent',
     'dietpi-panel',
   ];

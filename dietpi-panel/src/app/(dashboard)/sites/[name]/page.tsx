@@ -480,7 +480,7 @@ export default function SiteWorkspacePage({
       const r = res.result;
       setBanner({
         ok: true,
-        text: `Applied www-data ownership & ${r.type} permissions (dirs: ${r.dirsUpdated} updated, files: ${r.filesUpdated} updated${
+        text: `Applied ${me?.webUser || 'www-data'} ownership & ${r.type} permissions (dirs: ${r.dirsUpdated} updated, files: ${r.filesUpdated} updated${
           r.executablesFixed ? `, +x binaries: ${r.executablesFixed}` : ''
         }${r.writableDirs.length ? `, writable 0775: ${r.writableDirs.join(', ')}` : ''}).`,
       });
@@ -511,7 +511,7 @@ export default function SiteWorkspacePage({
       setPermsTarget(null);
       setBanner({
         ok: true,
-        text: `Updated /${res.result.path} to ${res.result.mode} (${res.result.updatedCount} item(s), owner www-data).`,
+        text: `Updated /${res.result.path} to ${res.result.mode} (${res.result.updatedCount} item(s), owner ${me?.webUser || 'www-data'}).`,
       });
       await mutateFiles();
     } finally {
@@ -692,7 +692,7 @@ export default function SiteWorkspacePage({
               disabled={fixingPerms}
               onClick={handleFixPermissions}
               className="inline-flex items-center gap-2 rounded-lg border border-borderline bg-surface px-3 py-2 text-xs font-medium text-slate-200 hover:border-slate-500 disabled:opacity-50 transition"
-              title="Apply www-data ownership and recommended framework file/folder permissions (755/644, +x binaries, Laravel 775 storage)"
+              title={`Apply ${me?.webUser || 'www-data'} ownership and recommended framework file/folder permissions (755/644, +x binaries, Laravel 775 storage)`}
             >
               <IconShield className="w-3.5 h-3.5 text-emerald-400" />
               <span>{fixingPerms ? 'Fixing...' : 'Fix Permissions'}</span>

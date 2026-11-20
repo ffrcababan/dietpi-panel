@@ -11,6 +11,15 @@ if [[ -f /etc/control-agent/config.env ]]; then
     source /etc/control-agent/config.env
 fi
 
+WEB_USER="${WEB_USER:-www-data}"
+WEB_GROUP="${WEB_GROUP:-$WEB_USER}"
+APACHE_SERVICE="${APACHE_SERVICE:-apache2}"
+APACHE_CTL="${APACHE_CTL:-$(command -v apache2ctl >/dev/null 2>&1 && echo apache2ctl || echo apachectl)}"
+APACHE_DIR="${APACHE_DIR:-/etc/apache2}"
+APACHE_SITES_AVAIL="${APACHE_SITES_AVAIL:-${APACHE_DIR}/sites-available}"
+APACHE_SITES_EN="${APACHE_SITES_EN:-${APACHE_DIR}/sites-enabled}"
+APACHE_CONF_DB="${APACHE_CONF_DB:-${APACHE_DIR}/conf-app-db}"
+
 NAME="${1:-}"
 TYPE="${2:-}"
 CUSTOM_DOMAIN="${3:-}"
@@ -49,7 +58,7 @@ if [[ "$DOMAIN" == "panel.${BASE_DOMAIN}" ]]; then
     exit 1
 fi
 
-VHOST_FILE="/etc/apache2/sites-available/${NAME}.conf"
+VHOST_FILE="${APACHE_SITES_AVAIL}/${NAME}.conf"
 SITE_ROOT="/var/www/${NAME}"
 SHARED_DB_PHP="/var/www/_shared/db.php"
 
@@ -67,7 +76,7 @@ fi
 
 # Check no other vhost already claims this ServerName
 shopt -s nullglob
-for existing_conf in /etc/apache2/sites-available/*.conf; do
+for existing_conf in "${APACHE_SITES_AVAIL}"/*.conf; do
     if [[ "$existing_conf" == "$VHOST_FILE" ]]; then
         continue
     fi
@@ -93,7 +102,7 @@ if (( IS_PROXY == 1 )); then
         fi
         PORT="$REQUESTED_PORT"
     else
-        used_ports=" $( (grep -RhoE '127\.0\.0\.1:[0-9]+' /etc/apache2/sites-available/*.conf 2>/dev/null || true) | awk -F: '{print $2}' | tr '\n' ' ') "
+        used_ports=" $( (grep -RhoE '127\.0\.0\.1:[0-9]+' "${APACHE_SITES_AVAIL}"/*.conf 2>/dev/null || true) | awk -F: '{print $2}' | tr '\n' ' ') "
         candidate=3100
         while (( candidate <= 39999 )); do
             if [[ "$used_ports" != *" ${candidate} "* ]]; then
@@ -153,8 +162,8 @@ if [[ ! -f "$SKEL_VHOST" ]]; then
     exit 1
 fi
 
-mkdir -p "$SITE_ROOT" "$DOCROOT"
-chown -R www-data:www-data "$SITE_ROOT"
+mkdir -p "$SITE_ROOT" "$DOCROOT" "$APACHE_SITES_AVAIL" "$APACHE_SITES_EN" "$APACHE_CONF_DB"
+chown -R "${WEB_USER}:${WEB_GROUP}" "$SITE_ROOT"
 chmod 0755 "$SITE_ROOT" "$DOCROOT"
 ln -sfn "$SHARED_DB_PHP" "${SITE_ROOT}/db.php"
 
@@ -174,7 +183,7 @@ header('Content-Type: text/html; charset=utf-8');
 </body>
 </html>
 EOF
-        chown www-data:www-data "${DOCROOT}/index.php"
+        chown "${WEB_USER}:${WEB_GROUP}" "${DOCROOT}/index.php"
     fi
 elif [[ "$TYPE" == "laravel" ]]; then
     if [[ ! -f "${DOCROOT}/index.php" ]]; then
@@ -191,7 +200,7 @@ header('Content-Type: text/html; charset=utf-8');
 </body>
 </html>
 EOF
-        chown www-data:www-data "${DOCROOT}/index.php"
+        chown "${WEB_USER}:${WEB_GROUP}" "${DOCROOT}/index.php"
     fi
 elif (( IS_PROXY == 0 )); then
     if [[ ! -f "${DOCROOT}/index.html" ]]; then
@@ -205,7 +214,7 @@ elif (( IS_PROXY == 0 )); then
 </body>
 </html>
 EOF
-        chown www-data:www-data "${DOCROOT}/index.html"
+        chown "${WEB_USER}:${WEB_GROUP}" "${DOCROOT}/index.html"
     fi
 else
     SYSTEMD_UNIT="/etc/systemd/system/app-${NAME}.service"
@@ -227,6 +236,8 @@ else
         sed -e "s|__NAME__|${NAME}|g" \
             -e "s|__TYPE__|${TYPE}|g" \
             -e "s|__PORT__|${PORT}|g" \
+            -e "s|__WEB_USER__|${WEB_USER}|g" \
+            -e "s|__WEB_GROUP__|${WEB_GROUP}|g" \
             -e "s|__ENV_FILE__|${ENV_FILE}|g" \
             -e "s|__EXEC_START__|${EXEC_START}|g" \
             "$SKEL_SERVICE" > "$SYSTEMD_UNIT"
@@ -245,24 +256,34 @@ sed -e "s|__NAME__|${NAME}|g" \
     -e "s|__TYPE__|${TYPE}|g" \
     -e "s|__DOMAIN__|${DOMAIN}|g" \
     -e "s|__DOCROOT__|${DOCROOT}|g" \
+    -e "s|__CONF_DB_DIR__|${APACHE_CONF_DB}|g" \
     -e "s|__FALLBACK_DIRECTIVE__|${FALLBACK_DIRECTIVE}|g" \
     -e "s|__PORT__|${PORT}|g" \
     "$SKEL_VHOST" > "$VHOST_FILE"
 chmod 0644 "$VHOST_FILE"
 
-a2ensite "${NAME}.conf" >/dev/null
-if ! apache2ctl configtest >/dev/null 2>&1; then
+if command -v a2ensite >/dev/null 2>&1 && [[ "$APACHE_DIR" == "/etc/apache2" ]] && [[ -d "/etc/apache2/mods-available" ]]; then
+    a2ensite "${NAME}.conf" >/dev/null
+else
+    ln -sfn "../sites-available/${NAME}.conf" "${APACHE_SITES_EN}/${NAME}.conf"
+fi
+
+if ! "$APACHE_CTL" configtest >/dev/null 2>&1; then
     if [[ -n "$BACKUP_OLD_VHOST" && -f "$BACKUP_OLD_VHOST" ]]; then
         mv -f "$BACKUP_OLD_VHOST" "$VHOST_FILE"
     else
-        a2dissite "${NAME}.conf" >/dev/null 2>&1 || true
+        if command -v a2dissite >/dev/null 2>&1 && [[ "$APACHE_DIR" == "/etc/apache2" ]] && [[ -d "/etc/apache2/mods-available" ]]; then
+            a2dissite "${NAME}.conf" >/dev/null 2>&1 || true
+        else
+            rm -f "${APACHE_SITES_EN}/${NAME}.conf"
+        fi
         rm -f "$VHOST_FILE"
     fi
     echo "Apache configtest failed for ${NAME}.conf; rolled back" >&2
     exit 1
 fi
 rm -f "$BACKUP_OLD_VHOST"
-systemctl reload apache2
+systemctl reload "$APACHE_SERVICE"
 
 if (( IS_PROXY == 1 )); then
     printf '{"name":"%s","type":"%s","domain":"%s","docroot":"%s","port":%s}\n' \

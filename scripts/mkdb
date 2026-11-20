@@ -10,6 +10,15 @@ if [[ -f /etc/control-agent/config.env ]]; then
     source /etc/control-agent/config.env
 fi
 
+WEB_USER="${WEB_USER:-www-data}"
+WEB_GROUP="${WEB_GROUP:-$WEB_USER}"
+APACHE_SERVICE="${APACHE_SERVICE:-apache2}"
+APACHE_CTL="${APACHE_CTL:-$(command -v apache2ctl >/dev/null 2>&1 && echo apache2ctl || echo apachectl)}"
+APACHE_DIR="${APACHE_DIR:-/etc/apache2}"
+APACHE_SITES_AVAIL="${APACHE_SITES_AVAIL:-${APACHE_DIR}/sites-available}"
+APACHE_SITES_EN="${APACHE_SITES_EN:-${APACHE_DIR}/sites-enabled}"
+APACHE_CONF_DB="${APACHE_CONF_DB:-${APACHE_DIR}/conf-app-db}"
+
 NAME="${1:-}"
 if [[ ! "$NAME" =~ ^[a-z0-9-]{1,32}$ ]]; then
     echo "Invalid database name: must match ^[a-z0-9-]{1,32}$" >&2
@@ -28,9 +37,9 @@ DB_DIR="/srv/db/${NAME}"
 DB_PATH="${DB_DIR}/data.sqlite"
 DOCROOT="/var/www/${NAME}"
 SHARED_DB_PHP="/var/www/_shared/db.php"
-CONF_DB_DIR="/etc/apache2/conf-app-db"
+CONF_DB_DIR="${APACHE_CONF_DB}"
 CONF_DB_FILE="${CONF_DB_DIR}/${NAME}.conf"
-VHOST_FILE="/etc/apache2/sites-available/${NAME}.conf"
+VHOST_FILE="${APACHE_SITES_AVAIL}/${NAME}.conf"
 SKEL_DBONLY="/etc/skel/vhost-dbonly.conf"
 
 if [[ -e "$DB_PATH" ]]; then
@@ -43,10 +52,10 @@ if [[ ! -f "$SHARED_DB_PHP" ]]; then
     exit 1
 fi
 
-mkdir -p "$DB_DIR" "$DOCROOT" "$CONF_DB_DIR"
+mkdir -p "$DB_DIR" "$DOCROOT" "$CONF_DB_DIR" "$APACHE_SITES_AVAIL" "$APACHE_SITES_EN"
 
 sqlite3 "$DB_PATH" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA user_version=0;" >/dev/null
-chown -R www-data:www-data "$DB_DIR"
+chown -R "${WEB_USER}:${WEB_GROUP}" "$DB_DIR"
 chmod 0750 "$DB_DIR"
 chmod 0640 "$DB_PATH"
 
@@ -61,7 +70,7 @@ umask 0022
 chown root:root "$CONF_DB_FILE"
 chmod 0600 "$CONF_DB_FILE"
 
-chown www-data:www-data "$DOCROOT"
+chown "${WEB_USER}:${WEB_GROUP}" "$DOCROOT"
 chmod 0755 "$DOCROOT"
 ln -sfn "$SHARED_DB_PHP" "${DOCROOT}/db.php"
 
@@ -76,16 +85,20 @@ else
         echo "Template missing: $SKEL_DBONLY" >&2
         exit 1
     fi
-    sed -e "s|__NAME__|${NAME}|g" -e "s|__DOMAIN__|${DOMAIN}|g" "$SKEL_DBONLY" > "$VHOST_FILE"
+    sed -e "s|__NAME__|${NAME}|g" -e "s|__DOMAIN__|${DOMAIN}|g" -e "s|__CONF_DB_DIR__|${CONF_DB_DIR}|g" "$SKEL_DBONLY" > "$VHOST_FILE"
     chmod 0644 "$VHOST_FILE"
 fi
 
-a2ensite "${NAME}.conf" >/dev/null
-if ! apache2ctl configtest >/dev/null 2>&1; then
+if command -v a2ensite >/dev/null 2>&1 && [[ "$APACHE_DIR" == "/etc/apache2" ]] && [[ -d "/etc/apache2/mods-available" ]]; then
+    a2ensite "${NAME}.conf" >/dev/null
+else
+    ln -sfn "../sites-available/${NAME}.conf" "${APACHE_SITES_EN}/${NAME}.conf"
+fi
+if ! "$APACHE_CTL" configtest >/dev/null 2>&1; then
     echo "Apache configtest failed after configuring ${NAME}.conf" >&2
     exit 1
 fi
-systemctl reload apache2
+systemctl reload "$APACHE_SERVICE"
 
 printf '{"name":"%s","domain":"%s","dbPath":"%s","apiKey":"%s","vhost":"%s"}\n' \
     "$NAME" "$DOMAIN" "$DB_PATH" "$API_KEY" "$VHOST_FILE"

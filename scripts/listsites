@@ -5,6 +5,14 @@ set -euo pipefail
 # Parses enabled Apache virtual hosts in /etc/apache2/sites-enabled/*.conf and outputs a JSON array of
 # {name, serverName, docroot, type, ssl, port, hasDb, isPanel}.
 
+if [[ -f /etc/control-agent/config.env ]]; then
+    # shellcheck disable=SC1091
+    source /etc/control-agent/config.env
+fi
+
+APACHE_DIR="${APACHE_DIR:-/etc/apache2}"
+APACHE_SITES_EN="${APACHE_SITES_EN:-${APACHE_DIR}/sites-enabled}"
+
 json_escape() {
     local s="$1"
     s="${s//\\/\\\\}"
@@ -16,13 +24,14 @@ json_escape() {
 }
 
 shopt -s nullglob
-enabled_files=(/etc/apache2/sites-enabled/*.conf)
+enabled_files=("${APACHE_SITES_EN}"/*.conf)
+extra_ssl_files=("${APACHE_DIR}/conf.d/"*-le-ssl.conf)
 shopt -u nullglob
 
 # Pass 1: collect SSL-enabled ServerNames and primary (non -le-ssl) ServerNames
 ssl_domains=" "
 primary_domains=" "
-for f in "${enabled_files[@]}"; do
+for f in "${enabled_files[@]}" "${extra_ssl_files[@]}"; do
     [[ -f "$f" && -r "$f" ]] || continue
     base="${f##*/}"
     sn="$(awk '{gsub(/\r/,"")} tolower($1)=="servername" {gsub(/^["'\'']|["'\'']$/,"",$2); print tolower($2); exit}' "$f" || true)"
@@ -52,7 +61,7 @@ for f in "${enabled_files[@]}"; do
     # Skip Certbot companion -le-ssl.conf when its base vhost is already listed
     if [[ "$base" == *-le-ssl.conf ]]; then
         base_stem="${base%-le-ssl.conf}"
-        if [[ -e "/etc/apache2/sites-enabled/${base_stem}.conf" ]] || [[ -n "$sn_lower" && "$primary_domains" == *" ${sn_lower} "* ]]; then
+        if [[ -e "${APACHE_SITES_EN}/${base_stem}.conf" ]] || [[ -n "$sn_lower" && "$primary_domains" == *" ${sn_lower} "* ]]; then
             continue
         fi
         stem="$base_stem"
@@ -88,7 +97,7 @@ for f in "${enabled_files[@]}"; do
     fi
 
     ssl_flag="false"
-    if [[ -e "/etc/apache2/sites-enabled/${stem}-le-ssl.conf" ]] || [[ -n "$sn_lower" && "$ssl_domains" == *" ${sn_lower} "* ]]; then
+    if [[ -e "${APACHE_SITES_EN}/${stem}-le-ssl.conf" ]] || [[ -n "$sn_lower" && "$ssl_domains" == *" ${sn_lower} "* ]]; then
         ssl_flag="true"
     fi
 

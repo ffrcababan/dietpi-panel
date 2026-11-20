@@ -10,6 +10,8 @@ if [[ -f /etc/control-agent/config.env ]]; then
 fi
 
 BASE_DOMAIN="${BASE_DOMAIN:-localhost}"
+APACHE_DIR="${APACHE_DIR:-/etc/apache2}"
+APACHE_SITES_AVAIL="${APACHE_SITES_AVAIL:-${APACHE_DIR}/sites-available}"
 
 shopt -s nullglob
 db_files=(/srv/db/*/data.sqlite)
@@ -34,7 +36,7 @@ for db_file in "${db_files[@]}"; do
 
     domain="${name}.${BASE_DOMAIN}"
     site_type="none"
-    vhost_file="/etc/apache2/sites-available/${name}.conf"
+    vhost_file="${APACHE_SITES_AVAIL}/${name}.conf"
     if [[ -f "$vhost_file" ]]; then
         existing_domain="$(awk 'tolower($1)=="servername" {print $2; exit}' "$vhost_file" || true)"
         if [[ -n "$existing_domain" ]]; then

@@ -16,6 +16,8 @@ export interface MeData {
   totpEnabled: boolean;
   baseDomain: string;
   agentConnected: boolean;
+  apacheUnit?: string;
+  webUser?: string;
 }
 
 interface PanelContextValue {

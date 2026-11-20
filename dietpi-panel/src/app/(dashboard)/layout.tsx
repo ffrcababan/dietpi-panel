@@ -27,6 +27,8 @@ export default async function DashboardLayout({
         totpEnabled: Boolean(auth.user.totp_secret),
         baseDomain: process.env.BASE_DOMAIN || 'localhost',
         agentConnected: false,
+        apacheUnit: process.env.APACHE_SERVICE || 'apache2',
+        webUser: process.env.WEB_USER || 'www-data',
       }}
     >
       {children}

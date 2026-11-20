@@ -122,8 +122,7 @@ export const DatabaseSqlTab = React.memo(function DatabaseSqlTab({
                 SQL Script Workbench
               </h2>
               <p className="text-xs text-slate-400">
-                Multi-statement PDO SQLite runner as{' '}
-                <span className="font-mono text-slate-300">www-data</span> ·{' '}
+                Multi-statement PDO SQLite runner ·{' '}
                 <kbd className="rounded border border-borderline bg-canvas px-1 text-[10px]">Ctrl</kbd>+
                 <kbd className="rounded border border-borderline bg-canvas px-1 text-[10px]">Enter</kbd> to run
               </p>

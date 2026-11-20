@@ -11,6 +11,7 @@ import {
   IconUpload,
 } from '@/components/Icons';
 import { Modal } from '@/components/Modal';
+import { usePanel } from '@/components/PanelContext';
 import type { FileEntry } from '@/app/api/sites/[name]/files/route';
 import { SAFE_FILENAME_RE } from '@/lib/validation';
 
@@ -144,6 +145,8 @@ export function NewFileModal({
   onClose: () => void;
   onCreate: (filename: string) => Promise<void>;
 }) {
+  const { me } = usePanel();
+  const webUser = me?.webUser || 'www-data';
   const [name, setName] = useState('');
   const [errMsg, setErrMsg] = useState<string | null>(null);
   React.useEffect(() => {
@@ -238,7 +241,7 @@ export function NewFileModal({
             /{currentDir ? `${currentDir}/` : ''}
             {trimmed || '<file>'}
           </span>
-          <span className="shrink-0 text-slate-300">mode {predictedMode} · www-data</span>
+          <span className="shrink-0 text-slate-300">mode {predictedMode} · {webUser}</span>
         </div>
 
         <div className="flex justify-end gap-2">
@@ -278,6 +281,8 @@ export function NewFolderModal({
   onClose: () => void;
   onCreate: (folderName: string) => Promise<void>;
 }) {
+  const { me } = usePanel();
+  const webUser = me?.webUser || 'www-data';
   const [name, setName] = useState('');
   const [errMsg, setErrMsg] = useState<string | null>(null);
   React.useEffect(() => {
@@ -345,7 +350,7 @@ export function NewFolderModal({
             /{currentDir ? `${currentDir}/` : ''}
             {trimmed || '<folder>'}
           </span>
-          <span className="shrink-0 text-slate-300">owner www-data · 0755</span>
+          <span className="shrink-0 text-slate-300">owner {webUser} · 0755</span>
         </div>
 
         <div className="flex justify-end gap-2">
@@ -415,6 +420,8 @@ export function UploadWebAppModal({
   onChangeAutoBuild: (autoBuild: boolean) => void;
   onSubmit: (e: React.FormEvent, plan: UploadPlan) => Promise<void>;
 }) {
+  const { me } = usePanel();
+  const webUser = me?.webUser || 'www-data';
   const [dragActive, setDragActive] = useState(false);
 
   const uploadPlan = useMemo(
@@ -689,7 +696,7 @@ export function UploadWebAppModal({
 
         <div className="rounded-lg border border-borderline bg-canvas/70 px-3 py-2 text-[11px] text-slate-400">
           <span className="font-medium text-slate-300">Auto-Permissions:</span>{' '}
-          <span className="font-mono text-slate-200">www-data</span> owner · Folders{' '}
+          <span className="font-mono text-slate-200">{webUser}</span> owner · Folders{' '}
           <span className="font-mono text-slate-200">0755</span> · Files{' '}
           <span className="font-mono text-slate-200">0644</span> ·{' '}
           <span className="font-mono text-amber-300">.env* 0640</span> · Binaries{' '}
@@ -777,6 +784,8 @@ export function PermissionsModal({
   onClose: () => void;
   onSubmit: (mode: string, recursive: boolean) => Promise<void>;
 }) {
+  const { me } = usePanel();
+  const webUser = me?.webUser || 'www-data';
   const [mode, setMode] = useState(target?.mode || '0644');
   const [recursive, setRecursive] = useState(false);
   const [errMsg, setErrMsg] = useState<string | null>(null);
@@ -793,7 +802,7 @@ export function PermissionsModal({
     <Modal
       open={Boolean(target)}
       title="File & Folder Permissions"
-      subtitle="All site files remain owned by www-data:www-data. Use 0775 (never 0777) for writable directories like Laravel storage/."
+      subtitle={`All site files remain owned by ${webUser}:${webUser}. Use 0775 (never 0777) for writable directories like Laravel storage/.`}
       onClose={() => !busy && onClose()}
       badge={<IconShield className="w-4 h-4 text-emerald-400" />}
     >

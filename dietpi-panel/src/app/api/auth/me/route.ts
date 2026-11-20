@@ -28,6 +28,8 @@ export async function GET() {
       totpEnabled: Boolean(auth.user.totp_secret),
       baseDomain: process.env.BASE_DOMAIN || 'localhost',
       agentConnected,
+      apacheUnit: process.env.APACHE_SERVICE || 'apache2',
+      webUser: process.env.WEB_USER || 'www-data',
     },
     {
       headers: {

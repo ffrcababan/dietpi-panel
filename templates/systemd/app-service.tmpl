@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=__WEB_USER__
+Group=__WEB_GROUP__
 WorkingDirectory=/var/www/__NAME__
 Environment=NODE_ENV=production
 Environment=PORT=__PORT__

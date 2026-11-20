@@ -31,6 +31,16 @@ const AGENT_SECRET = process.env.AGENT_SECRET || '';
 const BASE_DOMAIN = process.env.BASE_DOMAIN || 'localhost';
 const CERTBOT_EMAIL = process.env.CERTBOT_EMAIL || '';
 
+const WEB_USER = process.env.WEB_USER || 'www-data';
+const WEB_GROUP = process.env.WEB_GROUP || WEB_USER;
+const APACHE_SERVICE = process.env.APACHE_SERVICE || 'apache2';
+const APACHE_DIR = process.env.APACHE_DIR || '/etc/apache2';
+const APACHE_SITES_AVAIL = process.env.APACHE_SITES_AVAIL || `${APACHE_DIR}/sites-available`;
+const APACHE_SITES_EN = process.env.APACHE_SITES_EN || `${APACHE_DIR}/sites-enabled`;
+const APACHE_CONF_DB = process.env.APACHE_CONF_DB || `${APACHE_DIR}/conf-app-db`;
+const APACHE_CTL = process.env.APACHE_CTL || '';
+const PHP_FPM_SERVICE = process.env.PHP_FPM_SERVICE || '';
+
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_LOG_SIZE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -199,7 +209,10 @@ function validateDomain(domain) {
 }
 
 function getAllowedUnits() {
-  const units = new Set(['apache2', 'control-agent']);
+  const units = new Set([APACHE_SERVICE, 'control-agent']);
+  if (PHP_FPM_SERVICE && UNIT_RE.test(PHP_FPM_SERVICE)) {
+    units.add(PHP_FPM_SERVICE);
+  }
   const systemdDir = '/etc/systemd/system';
 
   if (fs.existsSync(systemdDir)) {
@@ -216,12 +229,14 @@ function getAllowedUnits() {
 
   if (
     UNIT_RE.test(CF_UNIT) &&
-    (fs.existsSync(CF_CONFIG_PATH) || fs.existsSync(`/lib/systemd/system/${CF_UNIT}.service`))
+    (fs.existsSync(CF_CONFIG_PATH) ||
+      fs.existsSync(`/lib/systemd/system/${CF_UNIT}.service`) ||
+      fs.existsSync(`/usr/lib/systemd/system/${CF_UNIT}.service`))
   ) {
     units.add(CF_UNIT);
   }
 
-  const priority = ['apache2', 'control-agent', 'dietpi-panel', CF_UNIT];
+  const priority = [APACHE_SERVICE, 'control-agent', 'dietpi-panel', CF_UNIT];
   const list = Array.from(units);
   list.sort((a, b) => {
     const ia = priority.indexOf(a);
@@ -276,9 +291,38 @@ async function runBin(binPath, args, timeout = DEFAULT_TIMEOUT_MS, extraEnv = {}
   }
 }
 
+function getApacheCtlBin() {
+  const candidates = [
+    APACHE_CTL,
+    '/usr/sbin/apache2ctl',
+    '/usr/bin/apache2ctl',
+    '/usr/sbin/apachectl',
+    '/usr/bin/apachectl',
+  ].filter(Boolean);
+  return findExecutable(candidates) || APACHE_CTL || 'apache2ctl';
+}
+
+async function disableApacheSite(confName) {
+  const a2dissiteBin = findExecutable([
+    '/usr/sbin/a2dissite',
+    '/usr/bin/a2dissite',
+    '/usr/local/sbin/a2dissite',
+  ]);
+  if (a2dissiteBin && APACHE_DIR === '/etc/apache2' && fs.existsSync('/etc/apache2/mods-available')) {
+    await runBin(a2dissiteBin, [confName]);
+    return;
+  }
+  const enPath = path.join(APACHE_SITES_EN, confName);
+  try {
+    fs.unlinkSync(enPath);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+}
+
 function getManagedSiteDomains() {
   const domains = new Set();
-  const availDir = '/etc/apache2/sites-available';
+  const availDir = APACHE_SITES_AVAIL;
   if (!fs.existsSync(availDir)) return domains;
   for (const file of fs.readdirSync(availDir)) {
     if (!file.endsWith('.conf')) continue;
@@ -1283,7 +1327,7 @@ async function installUploadedFile({
   if (extractZip && filename.toLowerCase().endsWith('.zip')) {
     const unzipBin = findExecutable(['/usr/bin/unzip', '/usr/local/bin/unzip']);
     if (!unzipBin) {
-      throw new Error('unzip is not installed on the server (apt install unzip)');
+      throw new Error('unzip is not installed on the server (install unzip or re-run install.sh)');
     }
     const stageDir = fs.mkdtempSync('/tmp/dp-unzip-');
     const zipTmp = sourcePath || path.join(stageDir, 'upload.zip');
@@ -1394,21 +1438,41 @@ const WATCH_IGNORED_DIRS = new Set([
 let cachedWwwDataIds = null;
 function getWwwDataIds() {
   if (cachedWwwDataIds) return cachedWwwDataIds;
+  let uid = null;
+  let gid = null;
   try {
     const passwd = fs.readFileSync('/etc/passwd', 'utf8');
     for (const line of passwd.split('\n')) {
       const parts = line.split(':');
-      if (parts[0] === 'www-data' && parts.length >= 4) {
-        const uid = Number.parseInt(parts[2], 10);
-        const gid = Number.parseInt(parts[3], 10);
-        if (Number.isInteger(uid) && Number.isInteger(gid)) {
-          cachedWwwDataIds = { uid, gid };
-          return cachedWwwDataIds;
+      if (parts[0] === WEB_USER && parts.length >= 4) {
+        const parsedUid = Number.parseInt(parts[2], 10);
+        const parsedGid = Number.parseInt(parts[3], 10);
+        if (Number.isInteger(parsedUid) && Number.isInteger(parsedGid)) {
+          uid = parsedUid;
+          gid = parsedGid;
+          break;
+        }
+      }
+    }
+    if (WEB_GROUP && WEB_GROUP !== WEB_USER) {
+      const groupText = fs.readFileSync('/etc/group', 'utf8');
+      for (const line of groupText.split('\n')) {
+        const parts = line.split(':');
+        if (parts[0] === WEB_GROUP && parts.length >= 3) {
+          const g = Number.parseInt(parts[2], 10);
+          if (Number.isInteger(g)) {
+            gid = g;
+            break;
+          }
         }
       }
     }
   } catch {
     // non-Linux local test fallback
+  }
+  if (uid !== null && gid !== null) {
+    cachedWwwDataIds = { uid, gid };
+    return cachedWwwDataIds;
   }
   return { uid: 33, gid: 33 };
 }
@@ -1557,7 +1621,7 @@ function resolveJailedPath(name, rawRelPath = '', opts = {}) {
 }
 
 function getSiteTypeFromVhost(name) {
-  const vhostPath = `/etc/apache2/sites-available/${name}.conf`;
+  const vhostPath = path.join(APACHE_SITES_AVAIL, `${name}.conf`);
   if (!fs.existsSync(vhostPath)) return 'custom';
   const content = fs.readFileSync(vhostPath, 'utf8');
   const m = content.match(/^#\s*dietpi-panel:type=([a-z0-9-]+)/m);
@@ -1728,7 +1792,7 @@ async function executeSiteBuildOnce(name, trigger = 'manual') {
   let allOk = true;
 
   const npmBin = findExecutable(['/usr/bin/npm', '/usr/local/bin/npm']) || 'npm';
-  const phpBin = findExecutable(['/usr/bin/php', '/usr/local/bin/php']) || 'php';
+  const phpBin = findExecutable(['/usr/bin/php', '/usr/local/bin/php', '/usr/bin/php8']) || 'php';
   const composerBin = findExecutable(['/usr/local/bin/composer', '/usr/bin/composer']);
   const pythonBin = findExecutable(['/usr/bin/python3', '/usr/local/bin/python3']) || 'python3';
 
@@ -1744,7 +1808,7 @@ async function executeSiteBuildOnce(name, trigger = 'manual') {
   steps.push({
     cmd: `permissions (${permPre.type})`,
     ok: true,
-    stdout: `Verified www-data ownership & Linux permissions (dirs updated: ${permPre.dirsUpdated}, files updated: ${permPre.filesUpdated}, executables +x: ${permPre.executablesFixed}${permPre.writableDirs.length ? `, writable 0775: ${permPre.writableDirs.join(', ')}` : ''}).`,
+    stdout: `Verified ${WEB_USER} ownership & Linux permissions (dirs updated: ${permPre.dirsUpdated}, files updated: ${permPre.filesUpdated}, executables +x: ${permPre.executablesFixed}${permPre.writableDirs.length ? `, writable 0775: ${permPre.writableDirs.join(', ')}` : ''}).`,
     stderr: '',
     durationMs: Date.now() - tPermPre,
   });
@@ -1776,7 +1840,7 @@ async function executeSiteBuildOnce(name, trigger = 'manual') {
           cmd: 'composer install',
           ok: false,
           stdout: '',
-          stderr: 'composer is not installed on the server (apt install composer)',
+          stderr: 'composer is not installed on the server (install composer or re-run install.sh)',
           durationMs: 0,
         });
         allOk = false;
@@ -2084,6 +2148,7 @@ async function runDbStudio(dbName, op, payload = {}) {
     '/usr/bin/php8.4',
     '/usr/bin/php8.3',
     '/usr/bin/php8.2',
+    '/usr/bin/php8',
   ]);
   if (!phpBin) {
     throw new Error('PHP CLI is required for database management');
@@ -2201,7 +2266,7 @@ async function handleAction(action, params = {}, socket = null) {
 
       movePathSafe(dbDir, path.join(trashDir, 'db'));
 
-      const confAppDb = `/etc/apache2/conf-app-db/${name}.conf`;
+      const confAppDb = path.join(APACHE_CONF_DB, `${name}.conf`);
       if (fs.existsSync(confAppDb)) {
         movePathSafe(confAppDb, path.join(trashDir, 'app-db.conf'));
       }
@@ -2216,18 +2281,22 @@ async function handleAction(action, params = {}, socket = null) {
         if (err.code !== 'ENOENT') throw err;
       }
 
-      const vhostPath = `/etc/apache2/sites-available/${name}.conf`;
+      const vhostPath = path.join(APACHE_SITES_AVAIL, `${name}.conf`);
       let removedDbonlyVhost = false;
       let dbonlyDomain = '';
       if (fs.existsSync(vhostPath)) {
         const vhostContent = fs.readFileSync(vhostPath, 'utf8');
         if (vhostContent.includes('# dietpi-panel:type=dbonly')) {
           dbonlyDomain = readVhostServerName(vhostPath);
-          await runBin('a2dissite', [`${name}.conf`]);
-          const leSslPath = `/etc/apache2/sites-available/${name}-le-ssl.conf`;
+          await disableApacheSite(`${name}.conf`);
+          const leSslPath = path.join(APACHE_SITES_AVAIL, `${name}-le-ssl.conf`);
           if (fs.existsSync(leSslPath)) {
-            await runBin('a2dissite', [`${name}-le-ssl.conf`]);
+            await disableApacheSite(`${name}-le-ssl.conf`);
             movePathSafe(leSslPath, path.join(trashDir, `${name}-le-ssl.conf`));
+          }
+          const confDLeSsl = path.join(APACHE_DIR, 'conf.d', `${name}-le-ssl.conf`);
+          if (fs.existsSync(confDLeSsl)) {
+            movePathSafe(confDLeSsl, path.join(trashDir, `conf.d-${name}-le-ssl.conf`));
           }
           movePathSafe(vhostPath, path.join(trashDir, `${name}.conf`));
           removedDbonlyVhost = true;
@@ -2239,11 +2308,11 @@ async function handleAction(action, params = {}, socket = null) {
         }
       }
 
-      const testRes = await runBin('apache2ctl', ['configtest']);
+      const testRes = await runBin(getApacheCtlBin(), ['configtest']);
       if (!testRes.ok) {
         return { ok: false, stdout: '', stderr: `Apache configtest failed: ${testRes.stderr}` };
       }
-      await runBin('systemctl', ['reload', 'apache2']);
+      await runBin('systemctl', ['reload', APACHE_SERVICE]);
 
       const dbTunnel = dbonlyDomain ? await tunnelRemoveHostname(dbonlyDomain) : undefined;
 
@@ -2359,8 +2428,8 @@ async function handleAction(action, params = {}, socket = null) {
 
     case 'site.delete': {
       const name = validateName(params.name, 'site name');
-      const vhostPath = `/etc/apache2/sites-available/${name}.conf`;
-      const leSslPath = `/etc/apache2/sites-available/${name}-le-ssl.conf`;
+      const vhostPath = path.join(APACHE_SITES_AVAIL, `${name}.conf`);
+      const leSslPath = path.join(APACHE_SITES_AVAIL, `${name}-le-ssl.conf`);
       const docroot = `/var/www/${name}`;
       const appService = `/etc/systemd/system/app-${name}.service`;
 
@@ -2377,10 +2446,14 @@ async function handleAction(action, params = {}, socket = null) {
       const archiveDir = path.join(archiveBase, `${name}-${timestampSlug()}`);
       fs.mkdirSync(archiveDir, { recursive: true, mode: 0o750 });
 
-      await runBin('a2dissite', [`${name}.conf`]);
+      await disableApacheSite(`${name}.conf`);
       if (fs.existsSync(leSslPath)) {
-        await runBin('a2dissite', [`${name}-le-ssl.conf`]);
+        await disableApacheSite(`${name}-le-ssl.conf`);
         movePathSafe(leSslPath, path.join(archiveDir, `${name}-le-ssl.conf`));
+      }
+      const confDLeSsl = path.join(APACHE_DIR, 'conf.d', `${name}-le-ssl.conf`);
+      if (fs.existsSync(confDLeSsl)) {
+        movePathSafe(confDLeSsl, path.join(archiveDir, `conf.d-${name}-le-ssl.conf`));
       }
       if (fs.existsSync(vhostPath)) {
         movePathSafe(vhostPath, path.join(archiveDir, `${name}.conf`));
@@ -2395,11 +2468,11 @@ async function handleAction(action, params = {}, socket = null) {
         await runBin('systemctl', ['daemon-reload']);
       }
 
-      const testRes = await runBin('apache2ctl', ['configtest']);
+      const testRes = await runBin(getApacheCtlBin(), ['configtest']);
       if (!testRes.ok) {
         return { ok: false, stdout: '', stderr: `Apache configtest failed: ${testRes.stderr}` };
       }
-      await runBin('systemctl', ['reload', 'apache2']);
+      await runBin('systemctl', ['reload', APACHE_SERVICE]);
 
       const siteTunnel = siteDomain ? await tunnelRemoveHostname(siteDomain) : undefined;
 
@@ -2540,7 +2613,7 @@ async function handleAction(action, params = {}, socket = null) {
       const [dbRes, siteRes, apacheRes, duRes, dfRes] = await Promise.all([
         runBin('/usr/local/bin/listdb', []),
         runBin('/usr/local/bin/listsites', []),
-        runBin('systemctl', ['is-active', 'apache2']),
+        runBin('systemctl', ['is-active', APACHE_SERVICE]),
         runBin('du', ['-sb', '/srv/db']),
         runBin('df', ['-B1', '--output=size,used,avail,pcent', '/srv/db']),
       ]);
@@ -2923,7 +2996,7 @@ async function handleAction(action, params = {}, socket = null) {
       }
       const parsedMode = Number.parseInt(modeStr, 8);
       if ((parsedMode & 0o002) !== 0) {
-        throw new Error('World-writable modes (e.g. 777) are blocked for security; use 775 with www-data ownership');
+        throw new Error(`World-writable modes (e.g. 777) are blocked for security; use 775 with ${WEB_USER} ownership`);
       }
       const rootLst = fs.lstatSync(targetPath);
       if (rootLst.isSymbolicLink()) {
@@ -2993,7 +3066,7 @@ async function handleAction(action, params = {}, socket = null) {
       const siteRoot = fs.realpathSync(`/var/www/${name}`);
       const gitBin = findExecutable(['/usr/bin/git', '/usr/local/bin/git']);
       if (!gitBin) {
-        throw new Error('git is not installed on the server (apt install git)');
+        throw new Error('git is not installed on the server (install git or re-run install.sh)');
       }
 
       const gitAction = typeof params.action === 'string' ? params.action : 'status';

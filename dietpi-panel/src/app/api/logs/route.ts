@@ -10,7 +10,8 @@ export async function GET(request: Request) {
   if (!auth.ok) return auth.response;
 
   const url = new URL(request.url);
-  const unitParam = url.searchParams.get('unit') || 'apache2';
+  const unitParam =
+    url.searchParams.get('unit') || process.env.APACHE_SERVICE || 'apache2';
   const linesParam = url.searchParams.get('lines') || '100';
 
   const unitCheck = validateUnitName(unitParam);

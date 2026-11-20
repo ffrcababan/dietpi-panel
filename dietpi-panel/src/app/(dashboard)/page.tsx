@@ -138,7 +138,7 @@ export default function OverviewPage() {
           >
             <div className="flex items-center justify-between">
               <span className="text-xs font-medium uppercase tracking-wider text-slate-400">
-                Apache2
+                {me?.apacheUnit === 'httpd' ? 'Apache (httpd)' : 'Apache2'}
               </span>
               <IconServer className="w-4 h-4 text-slate-400" />
             </div>

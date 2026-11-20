@@ -501,7 +501,7 @@ export default function DatabaseStudioPage({
             )}
           </div>
           <p className="mt-1 text-xs font-mono text-slate-400">
-            /srv/db/{dbName}/data.sqlite · Managed via PDO SQLite as www-data
+            /srv/db/{dbName}/data.sqlite · Managed via PDO SQLite as {me?.webUser || 'www-data'}
           </p>
         </div>
 

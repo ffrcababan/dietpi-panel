@@ -616,9 +616,9 @@ tar --exclude=node_modules --exclude=.next -cf - -C "${REPO_DIR}/dietpi-panel" .
 log "Installing npm dependencies and building Next.js production bundle..."
 pushd /opt/dietpi-panel >/dev/null
 if [[ -f package-lock.json ]]; then
-    NODE_ENV=development npm ci
+    npm ci --omit=dev --no-audit --no-fund
 else
-    NODE_ENV=development npm install
+    npm install --omit=dev --no-audit --no-fund
 fi
 NODE_ENV=production npm run build
 popd >/dev/null

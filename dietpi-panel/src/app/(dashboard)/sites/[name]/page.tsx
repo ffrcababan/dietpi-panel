@@ -2,6 +2,7 @@
 
 import React, { useCallback, useState } from 'react';
 import Link from 'next/link';
+import { useParams } from 'next/navigation';
 import useSWR from 'swr';
 import { IconRefresh, IconShield, IconUpload } from '@/components/Icons';
 import { usePanel } from '@/components/PanelContext';
@@ -38,11 +39,8 @@ function uint8ToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-export default function SiteWorkspacePage({
-  params,
-}: {
-  params: { name: string };
-}) {
+export default function SiteWorkspacePage() {
+  const params = useParams<{ name: string }>();
   const siteName = decodeURIComponent(params.name);
   const { me } = usePanel();
 
@@ -195,7 +193,7 @@ export default function SiteWorkspacePage({
         setSavingFile(false);
       }
     },
-    [me?.csrfToken, selectedFile, fileBinary, fileContent, siteName, mutateFiles, mutateBuild]
+    [me, selectedFile, fileBinary, fileContent, siteName, mutateFiles, mutateBuild]
   );
 
   const handleCreateFile = async (filename: string) => {
@@ -625,7 +623,7 @@ export default function SiteWorkspacePage({
       }
     },
     [
-      me?.csrfToken,
+      me,
       gitBusy,
       siteName,
       repoUrl,

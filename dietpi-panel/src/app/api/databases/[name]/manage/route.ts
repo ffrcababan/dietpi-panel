@@ -126,9 +126,10 @@ const MUTATING_OPS = new Set([
 
 export async function GET(
   request: Request,
-  context: { params: { name: string } }
+  context: { params: Promise<{ name: string }> }
 ) {
-  const nameCheck = validateResourceName(context.params.name, 'database name');
+  const { name } = await context.params;
+  const nameCheck = validateResourceName(name, 'database name');
   const auth = await requireResourceAccess(
     undefined,
     'database',
@@ -207,9 +208,10 @@ export async function GET(
 
 export async function POST(
   request: Request,
-  context: { params: { name: string } }
+  context: { params: Promise<{ name: string }> }
 ) {
-  const nameCheck = validateResourceName(context.params.name, 'database name');
+  const { name } = await context.params;
+  const nameCheck = validateResourceName(name, 'database name');
   const auth = await requireResourceAccess(
     request,
     'database',

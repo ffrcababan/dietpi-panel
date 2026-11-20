@@ -8,9 +8,10 @@ export const dynamic = 'force-dynamic';
 
 export async function DELETE(
   request: Request,
-  context: { params: { name: string } }
+  context: { params: Promise<{ name: string }> }
 ) {
-  const check = validateResourceName(context.params.name, 'site name');
+  const { name } = await context.params;
+  const check = validateResourceName(name, 'site name');
   if (!check.ok) {
     return NextResponse.json({ error: check.error }, { status: 400 });
   }

@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import { useParams } from 'next/navigation';
 import useSWR from 'swr';
 import {
   IconColumns,
@@ -46,11 +47,8 @@ type PendingConfirm =
 
 const MAX_SQL_HISTORY = 8;
 
-export default function DatabaseStudioPage({
-  params,
-}: {
-  params: { name: string };
-}) {
+export default function DatabaseStudioPage() {
+  const params = useParams<{ name: string }>();
   const dbName = decodeURIComponent(params.name);
   const { me } = usePanel();
   const sqlHistoryKey = `dp_sql_hist_${dbName}`;

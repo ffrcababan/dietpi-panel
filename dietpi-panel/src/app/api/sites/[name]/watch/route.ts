@@ -7,9 +7,10 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(
   request: Request,
-  context: { params: { name: string } }
+  context: { params: Promise<{ name: string }> }
 ) {
-  const nameCheck = validateResourceName(context.params.name, 'site name');
+  const { name } = await context.params;
+  const nameCheck = validateResourceName(name, 'site name');
   const auth = await requireResourceAccess(
     request,
     'site',

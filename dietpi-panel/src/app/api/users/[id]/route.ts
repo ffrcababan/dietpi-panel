@@ -39,12 +39,13 @@ function parseUserId(raw: string): number | null {
 
 export async function GET(
   _request: Request,
-  context: { params: { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   const auth = await requireAdmin();
   if (!auth.ok) return auth.response;
 
-  const userId = parseUserId(context.params.id);
+  const { id } = await context.params;
+  const userId = parseUserId(id);
   if (!userId) {
     return NextResponse.json({ error: 'Invalid user ID' }, { status: 400 });
   }
@@ -151,12 +152,13 @@ export async function GET(
 
 export async function PATCH(
   request: Request,
-  context: { params: { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   const auth = await requireAdmin(request);
   if (!auth.ok) return auth.response;
 
-  const userId = parseUserId(context.params.id);
+  const { id } = await context.params;
+  const userId = parseUserId(id);
   if (!userId) {
     return NextResponse.json({ error: 'Invalid user ID' }, { status: 400 });
   }
@@ -339,12 +341,13 @@ export async function PATCH(
 
 export async function POST(
   request: Request,
-  context: { params: { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   const auth = await requireAdmin(request);
   if (!auth.ok) return auth.response;
 
-  const userId = parseUserId(context.params.id);
+  const { id } = await context.params;
+  const userId = parseUserId(id);
   if (!userId) {
     return NextResponse.json({ error: 'Invalid user ID' }, { status: 400 });
   }
@@ -407,12 +410,13 @@ export async function POST(
 
 export async function DELETE(
   request: Request,
-  context: { params: { id: string } }
+  context: { params: Promise<{ id: string }> }
 ) {
   const auth = await requireAdmin(request);
   if (!auth.ok) return auth.response;
 
-  const userId = parseUserId(context.params.id);
+  const { id } = await context.params;
+  const userId = parseUserId(id);
   if (!userId) {
     return NextResponse.json({ error: 'Invalid user ID' }, { status: 400 });
   }

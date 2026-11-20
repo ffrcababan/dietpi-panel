@@ -30,7 +30,7 @@ function noStoreRedirect(request: NextRequest, targetPath: string): NextResponse
   return res;
 }
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   if (

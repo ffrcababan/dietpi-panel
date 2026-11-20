@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import useSWR from 'swr';
 import {
   IconDatabase,
@@ -42,11 +42,8 @@ interface UserDetailResponse {
   }>;
 }
 
-export default function UserDetailPage({
-  params,
-}: {
-  params: { id: string };
-}) {
+export default function UserDetailPage() {
+  const params = useParams<{ id: string }>();
   const router = useRouter();
   const { me } = usePanel();
   const userId = params.id;

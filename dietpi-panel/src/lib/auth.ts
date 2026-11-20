@@ -76,7 +76,8 @@ export async function getPendingTotpSession(): Promise<{
   user: UserRow;
   payload: SessionPayload;
 } | null> {
-  const token = cookies().get(SESSION_COOKIE_NAME)?.value;
+  const cookieStore = await cookies();
+  const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
   if (!token) return null;
   const payload = await verifySessionToken(token, getSessionSecret());
   if (!payload || payload.stage !== 'totp_pending') {
@@ -119,7 +120,8 @@ export async function requireSession(
     };
   }
 
-  const token = cookies().get(SESSION_COOKIE_NAME)?.value;
+  const cookieStore = await cookies();
+  const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
   const payload = await verifySessionToken(token, secret);
   if (!payload || payload.stage !== 'full') {
     return {

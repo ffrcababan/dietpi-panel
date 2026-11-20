@@ -7,12 +7,13 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(
   request: Request,
-  context: { params: { unit: string } }
+  context: { params: Promise<{ unit: string }> }
 ) {
   const auth = await requireAdmin(request);
   if (!auth.ok) return auth.response;
 
-  const check = validateUnitName(context.params.unit);
+  const { unit } = await context.params;
+  const check = validateUnitName(unit);
   if (!check.ok) {
     return NextResponse.json({ error: check.error }, { status: 400 });
   }

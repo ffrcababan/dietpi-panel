@@ -1,6 +1,6 @@
 # DietPi Panel
 
-A self-hosted server, web application, and SQLite database control panel inspired by the Cloudflare dashboard. Built with **Next.js 14 (App Router, React, TypeScript, Tailwind CSS)** backed by a privileged Node.js control daemon (**systemd** Unix socket) and isolated PHP/Apache runtimes.
+A self-hosted server, web application, and SQLite database control panel inspired by the Cloudflare dashboard. Built with **Next.js 16 (App Router + Turbopack, React 19, TypeScript, Tailwind CSS)** backed by a privileged Node.js control daemon (**systemd** Unix socket) and isolated PHP/Apache runtimes.
 
 ---
 
@@ -19,6 +19,7 @@ A self-hosted server, web application, and SQLite database control panel inspire
   - [5. Using the D1-Style HTTP Database Endpoint (`/db.php`)](#5-using-the-d1-style-http-database-endpoint-dbphp)
   - [6. System Services, Logs & Cloudflare Tunnels](#6-system-services-logs--cloudflare-tunnels)
 - [Security Model](#security-model)
+- [Local Development & Verification](#local-development--verification)
 - [Backup, Restore & Troubleshooting](#backup-restore--troubleshooting)
 
 ---
@@ -63,13 +64,13 @@ Running `install.sh` automatically detects `/etc/os-release` and installs any mi
 ## System Architecture & File Layout
 
 ```text
-Browser (Next.js App Router UI)
+Browser (Next.js 16 App Router UI)
   │  HTTPS (Apache / Certbot TLS / optional Cloudflare Tunnel)
   ▼
 Apache Reverse Proxy (panel.<domain> -> http://127.0.0.1:3000)
   │
   ▼
-Next.js Dashboard (/opt/dietpi-panel, runs as unprivileged `panel` user)
+Next.js 16 Dashboard (/opt/dietpi-panel, runs `src/proxy.ts` guard as `panel` user)
   ├── /srv/db/_panel/panel.sqlite  (users, scrypt hashes, 2FA TOTP secrets, resource ownership)
   ├── Local Unix Socket (/run/control-agent.sock, root:panel 0660 + AGENT_SECRET)
   ▼
@@ -83,7 +84,7 @@ Control Agent (/opt/control-agent/agent.js, systemd, runs as `root`)
 
 | Path | Purpose |
 |---|---|
-| `/opt/dietpi-panel` | Compiled Next.js application (`panel:panel`) |
+| `/opt/dietpi-panel` | Compiled Next.js 16 (Turbopack) production application (`panel:panel`) |
 | `/opt/control-agent/agent.js` | Privileged control daemon (`0750 root:root`) |
 | `/usr/local/lib/dietpi-panel/db-studio.php` | SQLite Database Studio PDO worker executed as web user (`0644 root:root`) |
 | `/etc/dietpi-panel/panel.env` | Next.js secrets & DB/Apache config (`0640 root:panel`) |
@@ -106,7 +107,7 @@ Control Agent (/opt/control-agent/agent.js, systemd, runs as `root`)
    cd DietpiPanel
    ```
 
-2. **Run the installer as `root`** (installs any missing OS stack automatically, builds Next.js, initializes SQLite auth, configures Apache & systemd):
+2. **Run the installer as `root`** (installs any missing OS stack automatically, runs a clean production install with `npm ci --omit=dev --no-audit --no-fund`, builds the Next.js 16 Turbopack bundle, initializes SQLite auth, and configures Apache & systemd):
    ```bash
    sudo bash install.sh
    ```
@@ -157,7 +158,7 @@ sudo apachectl configtest && sudo systemctl reload httpd
 
 ## Upgrading an Existing Installation
 
-No manual database migrations are needed. Re-running `install.sh` preserves `/etc/dietpi-panel/panel.env` secrets, `/etc/control-agent/config.env` domain/tunnel settings, your `/srv/db/_panel/panel.sqlite` users, and all hosted site/database data, while [`ensureSchema`](file:///d:/Dev%20Apps/DietpiPanel/DietpiPanel/dietpi-panel/src/lib/db.ts) automatically applies any schema additions on startup:
+No manual database migrations are needed. Re-running `install.sh` preserves `/etc/dietpi-panel/panel.env` secrets, `/etc/control-agent/config.env` domain/tunnel settings, your `/srv/db/_panel/panel.sqlite` users, and all hosted site/database data, while [`ensureSchema`](dietpi-panel/src/lib/db.ts) automatically applies any schema additions on startup and `install.sh` rebuilds the Next.js 16 production bundle cleanly using `npm ci --omit=dev --no-audit --no-fund` (zero ESLint deprecation warnings or audit banners):
 
 ```bash
 # Optional safety backup before upgrading
@@ -253,6 +254,24 @@ Responses:
    - File operations validate jailed paths via `lstat` / `realpathSync` to block symlink escapes and protect `/db.php`.
 3. **Database Studio Hardening**:
    - Executed by `db-studio.php` under the unprivileged web runtime user with PDO prepared statements, identifier regex/quoting, read-only SQL/script transaction options, and blocked `ATTACH` / `load_extension` statements.
+4. **Next.js 16 Proxy Auth & Route Guard (`src/proxy.ts`)**:
+   - Validates signed HMAC-SHA256 session cookies (`stage === 'full'`) before protected page or API execution, redirects accounts with `mustChangePassword` to `/account`, blocks `user` role access to admin sections (`/users`, `/services`, `/logs`, `/settings`), and applies `Cache-Control: no-store` headers on auth redirects and `401` API responses.
+
+---
+
+## Local Development & Verification
+
+The panel uses **Next.js 16 (App Router + Turbopack)**, **React 19**, **TypeScript 5**, and **ESLint 9** flat configuration ([`eslint.config.mjs`](dietpi-panel/eslint.config.mjs)). Build-time dependencies (`tailwindcss`, `postcss`, `autoprefixer`, `typescript`, `@types/*`) are declared in `dependencies` so target servers compile with `npm ci --omit=dev --no-audit --no-fund`, while `eslint` and `eslint-config-next` remain in `devDependencies`.
+
+```bash
+cd dietpi-panel
+npm install         # Installs runtime, build, and ESLint devDependencies locally
+npm run dev         # Starts local dev server on http://127.0.0.1:3000
+npm run typecheck   # Runs tsc --noEmit
+npm run lint        # Runs eslint .
+npm run build       # Builds the production Turbopack bundle
+npm audit           # Checks dependency advisories
+```
 
 ---
 

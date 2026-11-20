@@ -50,7 +50,7 @@ A self-hosted server, web application, and SQLite database control panel inspire
 
 **Requirements**: A Linux host running **`systemd`** (`systemctl` + `/run/systemd/system`) as `root` (or `sudo`). Non-Linux hosts and non-systemd Linux containers (e.g., stock Alpine Linux with OpenRC) are not supported.
 
-Running `install.sh` automatically detects `/etc/os-release` and installs any missing stack prerequisites (**Apache**, **PHP 8 + `pdo_sqlite`**, **Node.js 20+ / 22 LTS**, **SQLite3**, **OpenSSL**, **Git**, **Unzip**, **Python3**, plus optional **Composer** & **Certbot**):
+Running `install.sh` automatically detects `/etc/os-release` and installs any missing stack prerequisites (**Apache**, **PHP 8 + `pdo_sqlite`**, **Node.js 20+ / 22 LTS** — automatically replacing `<20` or pre-release `alpha`/`beta`/`rc` builds with verified Node.js 22 LTS, **SQLite3**, **OpenSSL**, **Git**, **Unzip**, **Python3**, plus optional **Composer** & **Certbot**):
 
 | Linux Family | Package Manager | Apache Service & Config Dir | Web Runtime User | PHP Integration | Extra OS Automation |
 |---|---|---|---|---|---|

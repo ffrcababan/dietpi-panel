@@ -187,6 +187,117 @@ node_major_version() {
     node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0
 }
 
+node_version_string() {
+    if ! command -v node >/dev/null 2>&1; then
+        return 0
+    fi
+    node -p 'process.version' 2>/dev/null || true
+}
+
+node_is_prerelease() {
+    local ver
+    ver="$(node_version_string)"
+    [[ -n "$ver" && "$ver" == *-* ]]
+}
+
+node_needs_lts() {
+    (( $(node_major_version) < 20 )) || node_is_prerelease
+}
+
+install_node22_tarball() {
+    local arch node_arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64)   node_arch="x64" ;;
+        aarch64|arm64)  node_arch="arm64" ;;
+        armv7l|armv7*)  node_arch="armv7l" ;;
+        *)
+            echo "Error: Unsupported CPU architecture '${arch}' for automatic Node.js binary install." >&2
+            return 1
+            ;;
+    esac
+
+    local tmp_dir base_url sums_url tar_name tar_url
+    tmp_dir="$(mktemp -d)"
+    base_url="https://nodejs.org/dist/latest-v22.x"
+    sums_url="${base_url}/SHASUMS256.txt"
+    if ! curl -fsSL "$sums_url" -o "${tmp_dir}/SHASUMS256.txt"; then
+        base_url="https://nodejs.org/dist/v22.23.5"
+        sums_url="${base_url}/SHASUMS256.txt"
+        curl -fsSL "$sums_url" -o "${tmp_dir}/SHASUMS256.txt" || { rm -rf "$tmp_dir"; return 1; }
+    fi
+
+    tar_name="$(awk -v a="$node_arch" '$2 ~ ("^node-v22\\.[0-9]+\\.[0-9]+-linux-" a "\\.tar\\.xz$") { print $2; exit }' "${tmp_dir}/SHASUMS256.txt")"
+    if [[ -z "$tar_name" ]]; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    tar_url="${base_url}/${tar_name}"
+
+    log "Downloading official Node.js (${tar_name}) with SHA-256 verification..."
+    if curl -fsSL "$tar_url" -o "${tmp_dir}/${tar_name}"; then
+        (cd "$tmp_dir" && grep "  ${tar_name}\$" SHASUMS256.txt | sha256sum -c -) || { rm -rf "$tmp_dir"; return 1; }
+        rm -rf /usr/local/include/node /usr/local/lib/node_modules/npm
+        tar --no-same-owner -xJf "${tmp_dir}/${tar_name}" --strip-components=1 -C /usr/local
+        rm -rf "$tmp_dir"
+        return 0
+    fi
+    rm -rf "$tmp_dir"
+    return 1
+}
+
+ensure_nodejs_lts() {
+    local family="$1"
+    if ! node_needs_lts; then
+        return 0
+    fi
+
+    local current_ver
+    current_ver="$(node_version_string)"
+    if [[ -n "$current_ver" ]]; then
+        warn "Detected incompatible or pre-release Node.js (${current_ver}); installing stable Node.js 22.x LTS..."
+    else
+        log "Installing Node.js 22.x LTS (required >= 20)..."
+    fi
+
+    # Replace pre-existing /usr/local/bin/node directly so it never shadows /usr/bin/node
+    if [[ -x /usr/local/bin/node ]]; then
+        install_node22_tarball
+        hash -r
+        return $?
+    fi
+
+    case "$family" in
+        debian)
+            apt-get install -y curl gnupg
+            curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+            apt-get install -y nodejs
+            ;;
+        rhel)
+            local dnf_bin="dnf"
+            command -v dnf >/dev/null 2>&1 || dnf_bin="yum"
+            curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+            "$dnf_bin" install -y nodejs
+            ;;
+        suse)
+            zypper --non-interactive install -y nodejs22 npm22 >/dev/null 2>&1 \
+                || zypper --non-interactive install -y nodejs20 npm20 >/dev/null 2>&1 \
+                || zypper --non-interactive install -y nodejs-default npm-default >/dev/null 2>&1 \
+                || true
+            if node_needs_lts; then
+                install_node22_tarball
+            fi
+            ;;
+        arch)
+            pacman -S --noconfirm --needed nodejs npm
+            if node_needs_lts; then
+                install_node22_tarball
+            fi
+            ;;
+    esac
+    hash -r
+}
+
 find_php_bin() {
     local c
     for c in "$(command -v php 2>/dev/null || true)" /usr/bin/php /usr/local/bin/php /usr/bin/php8 /usr/bin/php8.4 /usr/bin/php8.3 /usr/bin/php8.2; do
@@ -292,6 +403,7 @@ install_stack_debian() {
         git
         unzip
         tar
+        xz-utils
         ca-certificates
         python3
         python3-venv
@@ -301,12 +413,7 @@ install_stack_debian() {
     fi
     apt-get install -y "${core_pkgs[@]}"
 
-    if (( $(node_major_version) < 20 )); then
-        log "Installing Node.js 22.x LTS (required >= 20)..."
-        apt-get install -y curl gnupg
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-        apt-get install -y nodejs
-    fi
+    ensure_nodejs_lts debian
 
     local opt_pkg
     for opt_pkg in composer certbot python3-certbot-apache; do
@@ -339,6 +446,7 @@ install_stack_rhel() {
         git
         unzip
         tar
+        xz
         python3
         ca-certificates
     )
@@ -347,44 +455,12 @@ install_stack_rhel() {
     fi
     "$dnf_bin" install -y "${core_pkgs[@]}"
 
-    if (( $(node_major_version) < 20 )); then
-        log "Installing Node.js 22.x LTS (required >= 20)..."
-        curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
-        "$dnf_bin" install -y nodejs
-    fi
+    ensure_nodejs_lts rhel
 
     local opt_pkg
     for opt_pkg in certbot python3-certbot-apache composer policycoreutils-python-utils; do
         "$dnf_bin" install -y "$opt_pkg" >/dev/null 2>&1 || warn "Optional package '$opt_pkg' unavailable; skipping."
     done
-}
-
-install_node22_tarball() {
-    local arch node_arch ver="v22.14.0"
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64)   node_arch="x64" ;;
-        aarch64|arm64)  node_arch="arm64" ;;
-        armv7l|armv7*)  node_arch="armv7l" ;;
-        *)
-            echo "Error: Unsupported CPU architecture '${arch}' for automatic Node.js binary install." >&2
-            return 1
-            ;;
-    esac
-    log "Downloading official Node.js ${ver} (${node_arch}) with SHA-256 verification..."
-    local tmp_dir tar_name sums_url tar_url
-    tmp_dir="$(mktemp -d)"
-    tar_name="node-${ver}-linux-${node_arch}.tar.xz"
-    sums_url="https://nodejs.org/dist/${ver}/SHASUMS256.txt"
-    tar_url="https://nodejs.org/dist/${ver}/${tar_name}"
-    if curl -fsSL "$sums_url" -o "${tmp_dir}/SHASUMS256.txt" && curl -fsSL "$tar_url" -o "${tmp_dir}/${tar_name}"; then
-        (cd "$tmp_dir" && grep "  ${tar_name}\$" SHASUMS256.txt | sha256sum -c -)
-        tar -xJf "${tmp_dir}/${tar_name}" --strip-components=1 -C /usr/local
-        rm -rf "$tmp_dir"
-        return 0
-    fi
-    rm -rf "$tmp_dir"
-    return 1
 }
 
 install_stack_suse() {
@@ -405,16 +481,7 @@ install_stack_suse() {
         ln -sf /usr/bin/php8 /usr/bin/php
     fi
 
-    if (( $(node_major_version) < 20 )); then
-        log "Installing Node.js 20+ via zypper..."
-        zypper --non-interactive install -y nodejs22 npm22 >/dev/null 2>&1 \
-            || zypper --non-interactive install -y nodejs20 npm20 >/dev/null 2>&1 \
-            || zypper --non-interactive install -y nodejs-default npm-default >/dev/null 2>&1 \
-            || true
-    fi
-    if (( $(node_major_version) < 20 )); then
-        install_node22_tarball
-    fi
+    ensure_nodejs_lts suse
 
     local opt_pkg
     for opt_pkg in certbot python3-certbot-apache php8-composer composer; do
@@ -424,11 +491,12 @@ install_stack_suse() {
 
 install_stack_arch() {
     log "Installing/verifying required stack via pacman (${DISTRO_ID})..."
-    local core_pkgs=(apache php php-sqlite php-fpm sqlite openssl git unzip tar python nodejs npm ca-certificates)
+    local core_pkgs=(apache php php-sqlite php-fpm sqlite openssl git unzip tar xz python nodejs npm ca-certificates)
     if ! command -v curl >/dev/null 2>&1; then
         core_pkgs+=(curl)
     fi
     pacman -Sy --noconfirm --needed "${core_pkgs[@]}"
+    ensure_nodejs_lts arch
 
     if [[ -f /etc/php/php.ini ]]; then
         sed -i -E 's/^;(extension=(pdo_sqlite|sqlite3|openssl|curl|mbstring))/\1/' /etc/php/php.ini
@@ -471,6 +539,13 @@ NODE_MAJOR="$(node_major_version)"
 if (( NODE_MAJOR < 20 )); then
     echo "Error: Node.js 20+ is required (detected v${NODE_MAJOR})." >&2
     exit 1
+fi
+if node_is_prerelease; then
+    if [[ "$SKIP_PACKAGES" -eq 0 ]]; then
+        echo "Error: Pre-release Node.js ($(node_version_string)) is not supported." >&2
+        exit 1
+    fi
+    warn "Pre-release Node.js ($(node_version_string)) detected; stable Node.js 20-26 LTS is recommended."
 fi
 
 if ! "$PHP_BIN" -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);'; then
@@ -827,9 +902,15 @@ if [[ ! -f "$PANEL_VHOST" ]]; then
     sed "s|__BASE_DOMAIN__|${TARGET_DOMAIN}|g" /etc/skel/vhost-panel.conf > "$PANEL_VHOST"
     chmod 0644 "$PANEL_VHOST"
 else
-    sed -i 's/^[[:space:]]*ProxyTimeout 120$/    ProxyTimeout 600/' "$PANEL_VHOST" || true
+    sed -i \
+        -e 's/^[[:space:]]*ProxyTimeout 120$/    ProxyTimeout 600/' \
+        -e 's/^[[:space:]]*RequestHeader set X-Forwarded-Proto "http"$/    RequestHeader setifempty X-Forwarded-Proto "http"/' \
+        "$PANEL_VHOST" || true
     if [[ -f "${APACHE_SITES_AVAIL}/dietpi-panel-le-ssl.conf" ]]; then
-        sed -i 's/^[[:space:]]*ProxyTimeout 120$/    ProxyTimeout 600/' "${APACHE_SITES_AVAIL}/dietpi-panel-le-ssl.conf" || true
+        sed -i \
+            -e 's/^[[:space:]]*ProxyTimeout 120$/    ProxyTimeout 600/' \
+            -e 's/^[[:space:]]*RequestHeader set X-Forwarded-Proto "http"$/    RequestHeader setifempty X-Forwarded-Proto "http"/' \
+            "${APACHE_SITES_AVAIL}/dietpi-panel-le-ssl.conf" || true
     fi
     warn "${PANEL_VHOST} already exists; keeping existing Apache vhost configuration."
 fi

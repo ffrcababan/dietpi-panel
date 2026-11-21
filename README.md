@@ -239,7 +239,7 @@ Responses:
 
 - **Services (`/services`)**: Admins can monitor and restart Apache (`apache2` or `httpd`), `control-agent`, `dietpi-panel`, `php-fpm` (if enabled), `cloudflared` (when configured), and `app-<site>.service` runtimes.
 - **Logs (`/logs`)**: View recent `journalctl` output for any allowed service with configurable line counts and auto-refresh.
-- **Cloudflare Tunnel (`cloudflared`)**: If `cloudflared` and `/etc/cloudflared/config.yml` exist on the host, site/database creation and deletion automatically add/remove `# dietpi-panel:managed` ingress rules, validate the config, and reload `cloudflared`. Customize `CF_*` values in `/etc/control-agent/config.env`.
+- **Cloudflare Tunnel (`cloudflared`)**: If `cloudflared` and `/etc/cloudflared/config.yml` exist on the host, site/database creation and deletion automatically add/remove `# dietpi-panel:managed` ingress rules, validate the config, and reload `cloudflared` (unless covered by an existing wildcard rule such as `- hostname: "*.<domain>"` placed below `panel.<domain>`, which avoids `cloudflared` restarts and temporary `Error 1033` blips during create/delete). Customize `CF_*` values in `/etc/control-agent/config.env`, and ensure Cloudflare **Cache Everything** rules are disabled/bypassed on `panel.<domain>`.
 
 ---
 

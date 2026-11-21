@@ -465,14 +465,32 @@ function listIngressRules(content) {
   }));
 }
 
+function matchesIngressHostname(ruleHostname, targetHostname) {
+  const rule = String(ruleHostname || '').toLowerCase();
+  const target = String(targetHostname || '').toLowerCase();
+  if (!rule || !target) return false;
+  if (rule === target) return true;
+  if (rule.startsWith('*.')) {
+    const suffix = rule.slice(1);
+    if (target.endsWith(suffix)) {
+      const sub = target.slice(0, target.length - suffix.length);
+      return sub.length > 0 && !sub.includes('.');
+    }
+  }
+  return false;
+}
+
 function addIngressHostname(content, hostname, service) {
   const host = String(hostname).toLowerCase();
   const p = parseIngress(content);
   if (p.ingressIdx === -1) {
     throw new Error('No top-level "ingress:" block found in the cloudflared config');
   }
-  if (p.items.some((it) => it.hostname === host)) {
-    return { content, changed: false };
+  const covered = p.items.find(
+    (it) => matchesIngressHostname(it.hostname, host) && (it.hostname === host || !it.service || it.service === service)
+  );
+  if (covered) {
+    return { content, changed: false, matchedRule: covered.hostname };
   }
 
   const pad = ' '.repeat(p.itemIndent === null ? 2 : p.itemIndent);
@@ -658,9 +676,9 @@ async function tunnelAddHostname(rawDomain) {
 
     await withTunnelLock(async () => {
       const original = fs.readFileSync(CF_CONFIG_PATH, 'utf8');
-      const { content, changed } = addIngressHostname(original, hostname, settings.serviceUrl);
+      const { content, changed, matchedRule } = addIngressHostname(original, hostname, settings.serviceUrl);
       if (!changed) {
-        result.ingress = 'exists';
+        result.ingress = matchedRule && matchedRule.startsWith('*.') ? 'wildcard' : 'exists';
         return;
       }
       await writeValidatedTunnelConfig(settings, content);
@@ -733,11 +751,11 @@ async function tunnelRemoveHostname(rawDomain) {
   return result;
 }
 
-function getTunnelHostnameSet() {
+function getTunnelHostnames() {
   try {
     if (!fs.existsSync(CF_CONFIG_PATH)) return null;
     const rules = listIngressRules(fs.readFileSync(CF_CONFIG_PATH, 'utf8'));
-    return new Set(rules.map((r) => r.hostname).filter(Boolean));
+    return rules.map((r) => r.hostname).filter(Boolean);
   } catch {
     return null;
   }
@@ -2416,10 +2434,11 @@ async function handleAction(action, params = {}, socket = null) {
       if (!Array.isArray(sites)) {
         return { ok: true, stdout: raw, stderr: res.stderr };
       }
-      const hostSet = getTunnelHostnameSet();
+      const tunnelHosts = getTunnelHostnames();
       for (const site of sites) {
-        if (hostSet) {
-          site.tunnel = hostSet.has(String(site.serverName || '').toLowerCase());
+        if (tunnelHosts) {
+          const host = String(site.serverName || '').toLowerCase();
+          site.tunnel = tunnelHosts.some((ruleHost) => matchesIngressHostname(ruleHost, host));
         }
         site.watch = isSiteWatcherEnabled(String(site.name || ''));
       }
@@ -3477,6 +3496,7 @@ module.exports = {
   sanitizeParamsForLog,
   parseIngress,
   listIngressRules,
+  matchesIngressHostname,
   addIngressHostname,
   removeIngressHostname,
   resolveJailedPath,

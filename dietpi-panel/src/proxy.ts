@@ -24,10 +24,15 @@ function buildRedirectUrl(request: NextRequest, targetPath: string): URL {
   return new URL(targetPath, `${proto}://${host}`);
 }
 
-function noStoreRedirect(request: NextRequest, targetPath: string): NextResponse {
-  const res = NextResponse.redirect(buildRedirectUrl(request, targetPath));
-  res.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+function applyNoStoreHeaders(res: NextResponse): NextResponse {
+  res.headers.set('Cache-Control', 'private, no-store, no-cache, must-revalidate');
+  res.headers.set('CDN-Cache-Control', 'no-store');
+  res.headers.set('Cloudflare-CDN-Cache-Control', 'no-store');
   return res;
+}
+
+function noStoreRedirect(request: NextRequest, targetPath: string): NextResponse {
+  return applyNoStoreHeaders(NextResponse.redirect(buildRedirectUrl(request, targetPath)));
 }
 
 export async function proxy(request: NextRequest) {
@@ -51,17 +56,16 @@ export async function proxy(request: NextRequest) {
       const dest = payload.mustChangePassword ? '/account' : '/';
       return noStoreRedirect(request, dest);
     }
-    return NextResponse.next();
+    return applyNoStoreHeaders(NextResponse.next());
   }
 
   if (pathname.startsWith('/api/')) {
     if (!isAuthenticated) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401, headers: { 'Cache-Control': 'no-store, private' } }
+      return applyNoStoreHeaders(
+        NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
       );
     }
-    return NextResponse.next();
+    return applyNoStoreHeaders(NextResponse.next());
   }
 
   if (!isAuthenticated || !payload) {
@@ -79,7 +83,7 @@ export async function proxy(request: NextRequest) {
     return noStoreRedirect(request, '/');
   }
 
-  return NextResponse.next();
+  return applyNoStoreHeaders(NextResponse.next());
 }
 
 export const config = {
